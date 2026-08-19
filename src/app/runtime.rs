@@ -45,12 +45,27 @@ pub async fn run(
 
     // Mandatory cleanup, independent of how the loop ended: stop the
     // collector and join it so no detached task survives, even after a
-    // draw/command failure. Cleanup failures are ignored on purpose — the
-    // loop's own error (if any) is what must be reported.
+    // draw/command failure.
     let _ = commands_tx.send(CollectorCommand::Stop);
-    let _ = collector.await;
+    let joined = collector.await;
 
-    run_result
+    finish_run(run_result, joined)
+}
+
+/// Combine the event-loop result with the collector join.
+///
+/// - The loop's own error always wins: cleanup failures never mask it.
+/// - A collector panic (join error) on an otherwise clean exit is reported
+///   as a runtime error instead of silently returning success.
+fn finish_run(
+    run_result: anyhow::Result<i32>,
+    joined: Result<(), tokio::task::JoinError>,
+) -> anyhow::Result<i32> {
+    match (run_result, joined) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Ok(_), Err(err)) => Err(anyhow::anyhow!("collector task failed during shutdown: {err}")),
+        (Err(err), _) => Err(err),
+    }
 }
 
 /// The event loop body. Returns the exit code, or an error if a command
@@ -154,6 +169,41 @@ mod tests {
             .expect("runtime exits within timeout")
             .expect("runtime task does not panic");
         let err = result.expect_err("draw error propagates");
+        assert!(err.to_string().contains("draw failed"));
+    }
+
+    /// A real `JoinError` (from a panicking task) for the join-failure cases.
+    async fn panicking_join_error() -> tokio::task::JoinError {
+        tokio::spawn(async { panic!("collector boom") }).await.unwrap_err()
+    }
+
+    #[test]
+    fn finish_run_returns_clean_exit_on_success() {
+        assert_eq!(finish_run(Ok(0), Ok(())).expect("clean exit"), 0);
+    }
+
+    #[tokio::test]
+    async fn finish_run_reports_collector_panic_on_clean_exit() {
+        let err = finish_run(Ok(0), Err(panicking_join_error().await))
+            .expect_err("a collector panic must not be silently ignored");
+        assert!(err.to_string().contains("collector task failed"));
+    }
+
+    #[tokio::test]
+    async fn finish_run_keeps_loop_error_over_cleanup_error() {
+        let loop_err = anyhow::anyhow!("draw failed");
+        let err =
+            finish_run(Err(loop_err), Err(panicking_join_error().await)).expect_err("has error");
+        assert!(
+            err.to_string().contains("draw failed"),
+            "the loop error must not be masked by the join error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_run_keeps_loop_error_over_clean_join() {
+        let loop_err = anyhow::anyhow!("draw failed");
+        let err = finish_run(Err(loop_err), Ok(())).expect_err("has error");
         assert!(err.to_string().contains("draw failed"));
     }
 

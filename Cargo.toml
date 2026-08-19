@@ -1,0 +1,39 @@
+[package]
+name = "llamatop"
+version = "0.1.0"
+edition = "2021"
+description = "A Windows-native TUI/CLI monitor for llama.cpp llama-server"
+license = "MIT"
+repository = "https://github.com/NcaMoq/llamatop"
+rust-version = "1.85"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "string"] }
+crossterm = "0.29.0"
+directories = "6"
+nvml-wrapper = "0.12.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+url = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

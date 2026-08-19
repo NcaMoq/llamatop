@@ -1,0 +1,14 @@
+[
+  {
+    "id": 0,
+    "n_ctx": 65536,
+    "speculative": false,
+    "is_processing": false
+  },
+  {
+    "id": 1,
+    "n_ctx": 65536,
+    "speculative": true,
+    "is_processing": false
+  }
+]

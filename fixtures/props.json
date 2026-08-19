@@ -1,0 +1,34 @@
+{
+  "default_generation_settings": {
+    "id": 0,
+    "id_task": -1,
+    "n_ctx": 24576,
+    "speculative": false,
+    "is_processing": false,
+    "params": {
+      "n_predict": -1,
+      "temperature": 0.8
+    }
+  },
+  "total_slots": 2,
+  "model_alias": "qwen3.8-27b",
+  "model_path": "models/Qwen3.8-27B-Q4_K_M.gguf",
+  "modalities": {
+    "vision": false,
+    "video": false,
+    "audio": false
+  },
+  "media_marker": "<__media_x__>",
+  "endpoint_slots": true,
+  "endpoint_props": true,
+  "endpoint_metrics": true,
+  "ui": true,
+  "ui_settings": {},
+  "chat_template": "{{ template body never retained }}",
+  "chat_template_caps": {},
+  "bos_token": "<|begin_of_text|>",
+  "eos_token": "<|end_of_text|>",
+  "build_info": "b10488-9d77fa172",
+  "is_sleeping": false,
+  "cors_proxy_enabled": false
+}

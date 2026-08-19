@@ -4,10 +4,9 @@
 //! - `domain`: backend-agnostic monitoring state. Must not depend on ratatui,
 //!   reqwest, or NVML.
 //! - `backend`: concrete inference server implementations (HTTP + parsing).
-//! - `collector`: gathers data (backend, GPU, system) without touching the UI.
 //! - `detector`: pure state detection and rate calculation over snapshots.
 //! - `output`: human/JSON rendering of snapshots (no HTTP, no terminal TUI).
-//! - `ui`: terminal rendering (added with the TUI phase).
+//! - `ui`: terminal rendering and input (no HTTP, no raw llama.cpp types).
 
 pub mod backend;
 pub mod cli;
@@ -20,3 +19,4 @@ pub mod error;
 pub mod logging;
 pub mod output;
 pub mod snapshot;
+pub mod ui;

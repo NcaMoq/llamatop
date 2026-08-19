@@ -93,11 +93,7 @@ async fn run_tui(cli: &Cli) -> anyhow::Result<i32> {
             return Ok(EXIT_INVALID_CONFIG);
         }
     };
-    let _ = config;
-    anyhow::bail!(
-        "the interactive TUI is not available in this build phase; \
-         use `llamatop doctor` or `llamatop snapshot`"
-    );
+    llamatop::ui::run_tui(&config).await
 }
 
 /// Load and validate configuration.

@@ -8,13 +8,21 @@ API keys.
 
 ## Status
 
-This build provides the monitoring core and the non-interactive commands:
+This build provides the monitoring core, the non-interactive commands, and a
+basic interactive TUI:
 
 - `llamatop doctor` — environment and server connectivity check
 - `llamatop snapshot` — one-shot capture (human-readable or pure JSON)
+- `llamatop` (no subcommand) — interactive TUI with a header panel
+  (connection, backend, model, server state, workload phase, active/queued
+  requests, update age) and an inference panel (prompt/generation throughput,
+  active/queued, context size, slot count, speculative acceptance rate)
 
-The interactive TUI is not included in this build; invoking `llamatop` with no
-subcommand reports that the TUI is not yet available.
+TUI controls: `q` quit, `r` reconnect, `p` pause/resume. The terminal must be
+at least 80x20; smaller windows show a "too small" notice. Missing values are
+rendered as a placeholder, never as 0. `--ascii` forces an ASCII-only
+rendering. Slot tables, history graphs, the event log, GPU/system monitoring,
+and the help modal are not yet implemented.
 
 ## Requirements
 

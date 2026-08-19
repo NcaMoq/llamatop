@@ -56,10 +56,17 @@ impl FocusedPanel {
 
 /// The single owner of all TUI state.
 pub struct AppState {
+    // --- static configuration (display only, set once) ---
+    pub endpoint: String,
+    pub api_key_env: String,
+
     // --- backend data (updated by collector events) ---
     pub latest: Option<BackendSnapshot>,
     pub capabilities: BackendCapabilities,
     pub connection_message: Option<String>,
+    /// Set while the last reported backend error was an authentication
+    /// failure (the view then offers the env-var hint instead of a retry).
+    pub authentication_failed: bool,
 
     // --- bounded logs ---
     pub events: VecDeque<AppLogEvent>,
@@ -87,9 +94,12 @@ impl AppState {
     pub fn new(config: &Config) -> Self {
         let history = History::for_config(config.history_seconds, config.refresh_interval_ms);
         Self {
+            endpoint: config.endpoint.clone(),
+            api_key_env: config.authentication.api_key_env.clone(),
             latest: None,
             capabilities: BackendCapabilities::default(),
             connection_message: None,
+            authentication_failed: false,
             events: VecDeque::with_capacity(MAX_EVENTS),
             history,
             selected_slot: 0,
@@ -121,6 +131,12 @@ impl AppState {
     /// Seconds since the latest backend snapshot arrived (None if never).
     pub fn last_update_age(&self, now: Instant) -> Option<u64> {
         self.last_update.map(|t| now.duration_since(t).as_secs())
+    }
+
+    /// Milliseconds since the latest backend snapshot arrived (None if never).
+    /// Used for the header's sub-second "updated N ms ago" display.
+    pub fn last_update_age_ms(&self, now: Instant) -> Option<u64> {
+        self.last_update.map(|t| now.duration_since(t).as_millis() as u64)
     }
 
     /// Whether the collector should reconnect after this event round.
@@ -274,6 +290,11 @@ impl AppState {
 
     /// Apply a backend error summary.
     pub fn apply_error(&mut self, err: BackendErrorSummary) {
+        // `BackendError::Authentication` renders as "authentication failed: ..."
+        // (see `crate::error`); the flag drives the env-var hint view.
+        if err.message.starts_with("authentication failed") {
+            self.authentication_failed = true;
+        }
         self.connection_message = Some(err.message);
     }
 }

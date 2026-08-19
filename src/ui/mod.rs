@@ -9,10 +9,10 @@
 //! depend on `backend` raw types or perform any network I/O.
 
 mod input;
+mod panels;
 mod terminal;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::Frame;
 use ratatui::Terminal as RatatuiTerminal;
 
 use crate::app::event::AppEvent;
@@ -49,7 +49,7 @@ pub async fn run_tui(config: &Config) -> anyhow::Result<i32> {
 
     let result =
         runtime::run(config_owned, event_tx, event_rx, initial_size, |state: &AppState| {
-            term.draw(|f| render(f, state, &symbols)).map(|_| ())
+            term.draw(|f| panels::render(f, state, &symbols)).map(|_| ())
         })
         .await;
 
@@ -60,98 +60,289 @@ pub async fn run_tui(config: &Config) -> anyhow::Result<i32> {
     result
 }
 
-/// Render the full TUI frame. Safe for any size, including 0x0.
-fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
-    if state.terminal_size.0 == 0 || state.terminal_size.1 == 0 {
-        return;
-    }
-    let area = f.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-
-    let title = format!(
-        " {} llamatop — {} ",
-        symbols.active(),
-        state
-            .visible_snapshot()
-            .map(|s| s.connection.as_str().to_string())
-            .unwrap_or_else(|| symbols.idle().to_string())
-    );
-    let block = ratatui::widgets::Block::bordered().title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Minimal placeholder: will be replaced by panels in Step 4+.
-    let status = state
-        .visible_snapshot()
-        .map(|s| {
-            format!(
-                "Server: {}  Phase: {}  Active: {}",
-                s.server.as_str(),
-                s.workload_phase.display(),
-                s.active_requests.map(|v| v.to_string()).unwrap_or_else(|| "—".into())
-            )
-        })
-        .unwrap_or_else(|| "Waiting for data...".to_string());
-
-    let footer = " q Quit   r Reconnect   p Pause   l Logs   ? Help";
-    if inner.height >= 2 {
-        f.render_widget(
-            ratatui::widgets::Paragraph::new(status),
-            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-        f.render_widget(
-            ratatui::widgets::Paragraph::new(footer).alignment(ratatui::layout::Alignment::Center),
-            ratatui::layout::Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState, WorkloadPhase};
+
+    /// Render one frame and return the flattened cell text.
+    fn render_content(state: &AppState, ascii: bool, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut term = RatatuiTerminal::new(backend).expect("terminal");
+        term.draw(|f| panels::render(f, state, &Symbols::new(ascii))).expect("draw");
+        let buf = term.backend().buffer();
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| buf[(x, y)].symbol().to_string()))
+            .collect()
+    }
+
+    fn connected_ready(overrides: impl FnOnce(&mut BackendSnapshot)) -> AppState {
+        let config = Config::default();
+        let mut state = AppState::new(&config);
+        let mut snap = BackendSnapshot {
+            connection: ConnectionState::Connected,
+            server: ServerState::Ready,
+            workload_phase: WorkloadPhase::Decode,
+            workload_confidence: Confidence::High,
+            model_name: Some("qwen3.8-27b".into()),
+            active_requests: Some(1),
+            queued_requests: Some(0),
+            context_max_tokens: Some(262_144),
+            total_slots: Some(4),
+            ..Default::default()
+        };
+        overrides(&mut snap);
+        state.apply_snapshot(snap);
+        state
+    }
 
     #[test]
     fn render_is_safe_at_zero_size() {
-        let backend = ratatui::backend::TestBackend::new(1, 1);
-        let mut term = RatatuiTerminal::new(backend).expect("terminal");
         let state = AppState::new(&Config::default());
-        term.draw(|f| render(f, &state, &Symbols::new(false))).expect("draw");
+        let content = render_content(&state, false, 1, 1);
+        let _ = content; // must not panic; content may be empty
     }
 
     #[test]
-    fn render_shows_waiting_when_no_snapshot() {
-        let backend = ratatui::backend::TestBackend::new(80, 20);
-        let mut term = RatatuiTerminal::new(backend).expect("terminal");
-        let mut state = AppState::new(&Config::default());
-        state.terminal_size = (80, 20);
-        term.draw(|f| render(f, &state, &Symbols::new(false))).expect("draw");
-        let buf = term.backend().buffer();
-        let content: String =
-            (0..20).flat_map(|y| (0..80).map(move |x| buf[(x, y)].symbol().to_string())).collect();
-        assert!(content.contains("llamatop"));
-        assert!(content.contains("Waiting"));
+    fn waiting_shows_waiting_and_endpoint_not_disconnected() {
+        let state = AppState::new(&Config::default());
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Waiting for data..."));
+        assert!(content.contains("http://127.0.0.1:8080"));
+        assert!(!content.contains("DISCONNECTED"));
     }
 
     #[test]
-    fn render_shows_snapshot_data() {
-        let backend = ratatui::backend::TestBackend::new(80, 20);
-        let mut term = RatatuiTerminal::new(backend).expect("terminal");
-        let config = Config::default();
-        let mut state = AppState::new(&config);
-        state.terminal_size = (80, 20);
-        state.apply_snapshot(crate::domain::BackendSnapshot {
-            connection: crate::domain::ConnectionState::Connected,
-            server: crate::domain::ServerState::Ready,
-            active_requests: Some(3),
-            ..Default::default()
+    fn connected_ready_shows_header_and_inference() {
+        let state = connected_ready(|s| {
+            s.prompt_tokens_per_second = Some(1842.0);
+            s.generation_tokens_per_second = Some(52.0);
         });
-        term.draw(|f| render(f, &state, &Symbols::new(false))).expect("draw");
-        let buf = term.backend().buffer();
-        let content: String =
-            (0..20).flat_map(|y| (0..80).map(move |x| buf[(x, y)].symbol().to_string())).collect();
+        let content = render_content(&state, false, 80, 20);
         assert!(content.contains("CONNECTED"));
         assert!(content.contains("READY"));
+        assert!(content.contains("DECODE"));
+        assert!(content.contains("llama.cpp"));
+        assert!(content.contains("qwen3.8-27b"));
+        assert!(content.contains("1842.0 tok/s"));
+        assert!(content.contains("52.0 tok/s"));
+        assert!(content.contains("Inference"));
+    }
+
+    #[test]
+    fn connecting_shows_connecting_view() {
+        let mut state = connected_ready(|_| {});
+        state.apply_snapshot(BackendSnapshot {
+            connection: ConnectionState::Connecting,
+            ..Default::default()
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("CONNECTING"));
+        assert!(content.contains("Connecting to llama.cpp..."));
+    }
+
+    #[test]
+    fn reconnecting_shows_reconnecting_view() {
+        let mut state = connected_ready(|_| {});
+        state.apply_snapshot(BackendSnapshot {
+            connection: ConnectionState::Reconnecting,
+            ..Default::default()
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("RECONNECTING"));
+        assert!(content.contains("Retrying automatically..."));
+    }
+
+    #[test]
+    fn disconnected_shows_disconnected_view_with_endpoint() {
+        let mut state = connected_ready(|_| {});
+        state.apply_error(crate::app::event::BackendErrorSummary::new("connection refused"));
+        state.apply_snapshot(BackendSnapshot {
+            connection: ConnectionState::Disconnected,
+            error: Some("connection refused".into()),
+            ..Default::default()
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("DISCONNECTED"));
+        assert!(content.contains("Could not connect to llama.cpp."));
+        assert!(content.contains("Endpoint:"));
+        assert!(content.contains("http://127.0.0.1:8080"));
+        assert!(content.contains("Press r to retry or q to quit."));
+    }
+
+    #[test]
+    fn loading_shows_loading_view() {
+        let state = connected_ready(|s| s.server = ServerState::Loading);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("LOADING"));
+        assert!(content.contains("Model is loading..."));
+    }
+
+    #[test]
+    fn sleeping_shows_sleeping_view() {
+        let state = connected_ready(|s| s.server = ServerState::Sleeping);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("SLEEPING"));
+    }
+
+    #[test]
+    fn idle_shows_idle_phase() {
+        let state = connected_ready(|s| {
+            s.workload_phase = WorkloadPhase::Idle;
+            s.workload_confidence = Confidence::High;
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("IDLE"));
+    }
+
+    #[test]
+    fn prefill_likely_displays_star_marker() {
+        let state = connected_ready(|s| {
+            s.workload_phase = WorkloadPhase::PrefillLikely;
+            s.workload_confidence = Confidence::Estimated;
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("PREFILL*"));
+    }
+
+    #[test]
+    fn mixed_estimated_displays_star_marker() {
+        let state = connected_ready(|s| {
+            s.workload_phase = WorkloadPhase::Mixed;
+            s.workload_confidence = Confidence::Estimated;
+        });
+        let content = render_content(&state, false, 80, 20);
+        // Phase label MIXED plus the estimated-confidence marker.
+        assert!(content.contains("MIXED*"));
+    }
+
+    #[test]
+    fn processing_unknown_displays_question_marker() {
+        let state = connected_ready(|s| {
+            s.workload_phase = WorkloadPhase::ProcessingUnknown;
+            s.workload_confidence = Confidence::Unknown;
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("PROCESSING?"));
+    }
+
+    #[test]
+    fn unavailable_metrics_display_placeholder_not_zero() {
+        // Metrics unavailable: no delta and no server-reported average.
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("—"), "missing rates must show the em-dash placeholder");
+        assert!(!content.contains("0.0 tok/s"), "missing rates must not be rendered as zero");
+    }
+
+    #[test]
+    fn unavailable_optional_values_are_not_zero() {
+        // active/queued/context/slots/spec all None.
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        // The inference panel shows placeholders where nothing was reported.
+        assert!(content.contains("—"));
+        // Speculative acceptance is absent, not "0.0%".
+        assert!(!content.contains("0.0%"));
+    }
+
+    #[test]
+    fn long_model_name_does_not_break_layout() {
+        let state = connected_ready(|s| {
+            s.model_name = Some("Qwen3.8-27B-Q4_K_M-Long-Model-Name-That-Is-Quite-Long".into());
+        });
+        let content = render_content(&state, false, 80, 20);
+        // The model name is truncated with an ellipsis; the rest of the
+        // header line (phase/server) is still drawn.
+        assert!(content.contains("Qwen3.8-27B-Q4_K_M-Long-Model"));
+        assert!(content.contains("Server: READY"));
+    }
+
+    #[test]
+    fn long_endpoint_does_not_break_layout() {
+        let mut state = AppState::new(&Config::default());
+        state.endpoint =
+            "http://some-very-long-hostname.internal.example.com:8080/some/path".into();
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Waiting for data..."));
+        // Truncated endpoint still starts with the scheme.
+        assert!(content.contains("http://"));
+    }
+
+    #[test]
+    fn ascii_mode_contains_no_unicode_status_symbols() {
+        let state = connected_ready(|s| {
+            s.prompt_tokens_per_second = Some(10.0);
+            s.generation_tokens_per_second = Some(5.0);
+        });
+        let content = render_content(&state, true, 80, 20);
+        // State symbols and the placeholder must all be ASCII in ASCII mode.
+        assert!(!content.contains("●"));
+        assert!(!content.contains("○"));
+        assert!(!content.contains("▲"));
+        assert!(!content.contains("✘"));
+        assert!(!content.contains("…"));
+        assert!(!content.contains("—"), "ASCII mode uses '-' for missing values");
+        assert!(content.contains("-"), "ASCII placeholder is '-'");
+    }
+
+    #[test]
+    fn rendering_at_80x20_does_not_panic() {
+        let state = connected_ready(|s| {
+            s.prompt_tokens_per_second = Some(1.0);
+        });
+        let _ = render_content(&state, false, 80, 20);
+    }
+
+    #[test]
+    fn rendering_at_62x16_shows_too_small() {
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 62, 16);
+        assert!(content.contains("Terminal is too small."));
+        assert!(content.contains("Required: 80 x 20"));
+        assert!(content.contains("Current: 62 x 16"));
+    }
+
+    #[test]
+    fn rendering_at_1x1_does_not_panic() {
+        let state = connected_ready(|_| {});
+        let _ = render_content(&state, false, 1, 1);
+        let waiting = AppState::new(&Config::default());
+        let _ = render_content(&waiting, false, 1, 1);
+    }
+
+    #[test]
+    fn paused_state_is_visible_in_header() {
+        let mut state = connected_ready(|_| {});
+        state.handle_input(crate::app::event::InputAction::TogglePause);
+        assert!(state.paused);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("PAUSED"));
+    }
+
+    #[test]
+    fn footer_only_advertises_implemented_controls() {
+        let state = AppState::new(&Config::default());
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("q Quit"));
+        assert!(content.contains("r Reconnect"));
+        assert!(content.contains("p Pause"));
+        assert!(!content.contains("? Help"), "help modal is not implemented yet");
+        assert!(!content.contains("l Logs"), "event log panel is not implemented yet");
+    }
+
+    #[test]
+    fn rate_falls_back_to_server_reported_average() {
+        let state = connected_ready(|s| {
+            // No local delta; server-reported average only.
+            s.prompt_tokens_per_second = None;
+            s.prompt_tokens_per_second_reported = Some(999.0);
+            s.generation_tokens_per_second = None;
+            s.generation_tokens_per_second_reported = None;
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("999.0 tok/s"));
+        // Generation has neither delta nor reported value: placeholder.
+        assert!(content.contains("—"));
     }
 }

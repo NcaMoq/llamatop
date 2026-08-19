@@ -13,6 +13,11 @@ impl Symbols {
         Self { ascii }
     }
 
+    /// Whether the ASCII-only symbol set is active.
+    pub fn is_ascii(&self) -> bool {
+        self.ascii
+    }
+
     pub fn success(&self) -> &'static str {
         if self.ascii {
             "[OK]"

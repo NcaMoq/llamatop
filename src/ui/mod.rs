@@ -1,30 +1,28 @@
 //! Terminal user interface for `llamatop`.
 //!
 //! The TUI is the only module that talks to the terminal. It renders from
-//! application state and never performs HTTP; data will arrive through an
-//! event channel (see the following steps for the event loop and collector).
+//! application state and never performs HTTP; data arrives through an event
+//! channel from the backend collector, and keyboard input is mapped by
+//! `input.rs`.
 //!
-//! Step 2 (current): minimal terminal foundation — guard, panic restoration,
-//! empty frame, `q`/Ctrl+C, resize. Panels and the event loop are added in
-//! the following steps.
+//! Layering: `ui` depends on `app`, `domain`, and `config`. It does not
+//! depend on `backend` raw types or perform any network I/O.
 
+mod input;
 mod terminal;
 
-use std::time::Duration;
-
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Frame;
 use ratatui::Terminal as RatatuiTerminal;
 
+use crate::app::event::AppEvent;
+use crate::app::runtime;
+use crate::app::state::AppState;
 use crate::config::Config;
 use crate::display::Symbols;
+use crate::ui::input::InputReader;
 
 pub use terminal::{PanicRestorer, TerminalGuard, TerminalModes};
-
-/// Bounds idle CPU use: the loop wakes at least this often to age the
-/// "last update" display and at most this often when idle.
-const RENDER_TICK: Duration = Duration::from_millis(100);
 
 /// Run the interactive TUI until the user quits.
 ///
@@ -43,49 +41,28 @@ pub async fn run_tui(config: &Config) -> anyhow::Result<i32> {
         .map_err(|e| anyhow::anyhow!("terminal initialization failed: {e}"))?;
 
     let symbols = Symbols::new(config.ascii);
-    let result = minimal_loop(&mut term, &symbols);
+    let initial_size = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 20));
 
-    // Restore the terminal before anything else; the guard's Drop is the
-    // second safety net (idempotent).
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+    let mut reader = InputReader::start(event_tx.clone());
+    let config_owned = config.clone();
+
+    let result =
+        runtime::run(config_owned, event_tx, event_rx, initial_size, |state: &AppState| {
+            term.draw(|f| render(f, state, &symbols)).map(|_| ())
+        })
+        .await;
+
+    reader.stop();
     guard.restore();
     drop(restorer);
 
     result
 }
 
-fn minimal_loop(
-    term: &mut RatatuiTerminal<CrosstermBackend<std::io::Stdout>>,
-    symbols: &Symbols,
-) -> anyhow::Result<i32> {
-    let mut size = (0u16, 0u16);
-    let mut quit = false;
-
-    while !quit {
-        if event::poll(RENDER_TICK)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => quit = true,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        quit = true;
-                    }
-                    _ => {}
-                },
-                Event::Resize(width, height) => size = (width, height),
-                _ => {}
-            }
-        }
-
-        term.draw(|f| {
-            render_minimal(f, size, symbols);
-        })?;
-    }
-
-    Ok(0)
-}
-
-/// Render the minimal placeholder frame. Safe for any size, including 0x0.
-fn render_minimal(f: &mut Frame, size: (u16, u16), symbols: &Symbols) {
-    if size.0 == 0 || size.1 == 0 {
+/// Render the full TUI frame. Safe for any size, including 0x0.
+fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
+    if state.terminal_size.0 == 0 || state.terminal_size.1 == 0 {
         return;
     }
     let area = f.area();
@@ -93,14 +70,42 @@ fn render_minimal(f: &mut Frame, size: (u16, u16), symbols: &Symbols) {
         return;
     }
 
-    f.render_widget(
-        ratatui::widgets::Block::bordered().title(format!(" {} llamatop ", symbols.active())),
-        area,
+    let title = format!(
+        " {} llamatop — {} ",
+        symbols.active(),
+        state
+            .visible_snapshot()
+            .map(|s| s.connection.as_str().to_string())
+            .unwrap_or_else(|| symbols.idle().to_string())
     );
-    f.render_widget(
-        ratatui::widgets::Paragraph::new("llamatop — monitoring TUI. Press q to quit."),
-        area,
-    );
+    let block = ratatui::widgets::Block::bordered().title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Minimal placeholder: will be replaced by panels in Step 4+.
+    let status = state
+        .visible_snapshot()
+        .map(|s| {
+            format!(
+                "Server: {}  Phase: {}  Active: {}",
+                s.server.as_str(),
+                s.workload_phase.display(),
+                s.active_requests.map(|v| v.to_string()).unwrap_or_else(|| "—".into())
+            )
+        })
+        .unwrap_or_else(|| "Waiting for data...".to_string());
+
+    let footer = " q Quit   r Reconnect   p Pause   l Logs   ? Help";
+    if inner.height >= 2 {
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(status),
+            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(footer).alignment(ratatui::layout::Alignment::Center),
+            ratatui::layout::Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -108,20 +113,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_minimal_is_safe_at_zero_size() {
+    fn render_is_safe_at_zero_size() {
         let backend = ratatui::backend::TestBackend::new(1, 1);
         let mut term = RatatuiTerminal::new(backend).expect("terminal");
-        term.draw(|f| render_minimal(f, (0, 0), &Symbols::new(false))).expect("draw");
+        let state = AppState::new(&Config::default());
+        term.draw(|f| render(f, &state, &Symbols::new(false))).expect("draw");
     }
 
     #[test]
-    fn render_minimal_draws_title_on_normal_size() {
+    fn render_shows_waiting_when_no_snapshot() {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut term = RatatuiTerminal::new(backend).expect("terminal");
-        term.draw(|f| render_minimal(f, (80, 20), &Symbols::new(false))).expect("draw");
+        let mut state = AppState::new(&Config::default());
+        state.terminal_size = (80, 20);
+        term.draw(|f| render(f, &state, &Symbols::new(false))).expect("draw");
         let buf = term.backend().buffer();
         let content: String =
             (0..20).flat_map(|y| (0..80).map(move |x| buf[(x, y)].symbol().to_string())).collect();
         assert!(content.contains("llamatop"));
+        assert!(content.contains("Waiting"));
+    }
+
+    #[test]
+    fn render_shows_snapshot_data() {
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut term = RatatuiTerminal::new(backend).expect("terminal");
+        let config = Config::default();
+        let mut state = AppState::new(&config);
+        state.terminal_size = (80, 20);
+        state.apply_snapshot(crate::domain::BackendSnapshot {
+            connection: crate::domain::ConnectionState::Connected,
+            server: crate::domain::ServerState::Ready,
+            active_requests: Some(3),
+            ..Default::default()
+        });
+        term.draw(|f| render(f, &state, &Symbols::new(false))).expect("draw");
+        let buf = term.backend().buffer();
+        let content: String =
+            (0..20).flat_map(|y| (0..80).map(move |x| buf[(x, y)].symbol().to_string())).collect();
+        assert!(content.contains("CONNECTED"));
+        assert!(content.contains("READY"));
     }
 }

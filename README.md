@@ -1,10 +1,10 @@
 # llamatop
 
 A Windows-native terminal monitor for [llama.cpp](https://github.com/ggml-org/llama.cpp)
-`llama-server`. It observes server state, per-slot workload phase, throughput,
-and (when available) NVIDIA GPU metrics — without ever requesting, storing, or
-displaying prompt or completion text, and without ever displaying or logging
-API keys.
+`llama-server`. It observes server state, per-slot workload phase, and
+throughput, without ever requesting, storing, or displaying prompt or
+completion text, and without ever displaying or logging API keys. NVIDIA GPU
+metrics (and CPU/RAM monitoring) are planned, not yet implemented.
 
 ## Status
 
@@ -29,9 +29,9 @@ and the help modal are not yet implemented.
 - Windows (x86_64), Rust stable (MSVC toolchain) for building
 - A running `llama-server` (any recent llama.cpp build)
 
-No Python, Node.js, Docker, or WSL is required. GPU monitoring uses NVIDIA NVML
-when the driver is present; it degrades to a warning (never a crash) when NVML
-or a GPU is unavailable.
+No Python, Node.js, Docker, or WSL is required. Planned GPU monitoring will
+use NVIDIA NVML when the driver is present and degrade to a warning (never a
+crash) when NVML or a GPU is unavailable.
 
 ## Building
 

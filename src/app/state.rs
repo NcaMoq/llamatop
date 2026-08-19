@@ -212,6 +212,11 @@ impl AppState {
             self.paused = false;
             self.frozen_snapshot = None;
             self.log("Resume: showing latest snapshot");
+        } else if self.latest.is_none() {
+            // No snapshot to freeze yet: ignoring the request keeps the
+            // "Waiting for data..." view from sticking after the first
+            // snapshot arrives.
+            self.log("Pause ignored: no data yet");
         } else {
             self.paused = true;
             self.frozen_snapshot = self.latest.clone();
@@ -234,8 +239,13 @@ impl AppState {
         }
         self.previous_connection = Some(snap.connection);
 
-        // Server lifecycle transitions.
+        // A connected snapshot clears stale error state from previous
+        // failures (auth errors, transport errors). An error carried by
+        // this snapshot itself is current and is kept.
         if snap.connection == ConnectionState::Connected {
+            self.authentication_failed = false;
+            self.connection_message = snap.error.clone();
+
             let changed = self.latest.as_ref().map(|l| l.server != snap.server).unwrap_or(true);
             if changed {
                 match snap.server {
@@ -351,6 +361,51 @@ mod tests {
         s.handle_input(InputAction::TogglePause);
         assert!(!s.paused);
         assert_eq!(s.visible_snapshot().unwrap().generation_tokens_per_second, Some(99.0));
+    }
+
+    #[test]
+    fn pause_before_any_snapshot_is_ignored() {
+        let mut s = AppState::new(&config());
+        s.handle_input(InputAction::TogglePause);
+        assert!(!s.paused, "pause must be ignored until a snapshot exists");
+        // The first snapshot still becomes visible (no stuck Waiting view).
+        s.apply_snapshot(snapshot(ConnectionState::Connected, Some(10.0)));
+        assert_eq!(s.visible_snapshot().unwrap().generation_tokens_per_second, Some(10.0));
+        // Pause works normally once data exists.
+        s.handle_input(InputAction::TogglePause);
+        assert!(s.paused);
+    }
+
+    #[test]
+    fn authentication_error_is_cleared_by_connected_snapshot() {
+        let mut s = AppState::new(&config());
+        s.apply_error(BackendErrorSummary::new(
+            "authentication failed: the server rejected the API key (HTTP 401)",
+        ));
+        assert!(s.authentication_failed);
+        assert!(s.connection_message.is_some());
+        s.apply_snapshot(snapshot(ConnectionState::Connected, Some(10.0)));
+        assert!(!s.authentication_failed, "stale auth failure must not survive a connection");
+        assert!(s.connection_message.is_none(), "stale error message must be cleared");
+    }
+
+    #[test]
+    fn transport_error_is_cleared_by_connected_snapshot() {
+        let mut s = AppState::new(&config());
+        s.apply_error(BackendErrorSummary::new("cannot connect: connection refused"));
+        assert!(s.connection_message.is_some());
+        s.apply_snapshot(snapshot(ConnectionState::Connected, Some(10.0)));
+        assert!(s.connection_message.is_none(), "stale transport error must be cleared");
+    }
+
+    #[test]
+    fn connected_snapshot_with_active_error_keeps_it() {
+        let mut s = AppState::new(&config());
+        let mut snap = snapshot(ConnectionState::Connected, Some(10.0));
+        snap.error = Some("props endpoint failed".into());
+        s.apply_snapshot(snap);
+        assert_eq!(s.connection_message.as_deref(), Some("props endpoint failed"));
+        assert!(!s.authentication_failed);
     }
 
     #[test]

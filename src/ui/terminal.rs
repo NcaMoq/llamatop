@@ -33,6 +33,25 @@ pub fn restore_modes(modes: TerminalModes) {
     }
 }
 
+/// Apply the three mode changes in order, recording each in `guard` only
+/// after it succeeds and stopping at the first failure. Kept separate from
+/// [`TerminalGuard::new`] so the partial-success transition can be tested
+/// without touching the real terminal.
+fn initialize_staged(
+    guard: &mut TerminalGuard,
+    raw_mode: impl FnOnce() -> io::Result<()>,
+    alternate_screen: impl FnOnce() -> io::Result<()>,
+    hide_cursor: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    raw_mode()?;
+    guard.modes.raw_mode = true;
+    alternate_screen()?;
+    guard.modes.alternate_screen = true;
+    hide_cursor()?;
+    guard.modes.cursor_hidden = true;
+    Ok(())
+}
+
 /// Holds the terminal mode changes made for the TUI and restores them.
 ///
 /// Restoration is idempotent: calling [`TerminalGuard::restore`] (or dropping
@@ -45,22 +64,18 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     /// Enable raw mode, enter the alternate screen, and hide the cursor.
     ///
-    /// On failure, whatever was already enabled is restored before the error
-    /// is returned, so a failed start never leaves the terminal modified.
+    /// Each mode change is applied and recorded individually, so a failure
+    /// partway through restores only the changes that actually succeeded
+    /// (never leaving, e.g., the alternate screen on while raw mode was
+    /// already disabled). A failed start never leaves the terminal modified.
     pub fn new() -> io::Result<Self> {
         let mut guard = Self { modes: TerminalModes::default(), restored: false };
-        let result = (|| -> io::Result<()> {
-            crossterm::terminal::enable_raw_mode()?;
-            guard.modes.raw_mode = true;
-            crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::EnterAlternateScreen,
-                crossterm::cursor::Hide
-            )?;
-            guard.modes.alternate_screen = true;
-            guard.modes.cursor_hidden = true;
-            Ok(())
-        })();
+        let result = initialize_staged(
+            &mut guard,
+            crossterm::terminal::enable_raw_mode,
+            || crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen),
+            || crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide),
+        );
         if result.is_err() {
             guard.restore();
         }
@@ -186,6 +201,50 @@ mod tests {
         guard.restore();
         assert!(guard.is_restored());
         assert_eq!(guard.modes(), TerminalModes::default());
+    }
+
+    #[test]
+    fn staged_init_records_each_mode_only_after_success() {
+        let ok = || Ok(());
+        let mut guard = TerminalGuard::from_modes_for_test(TerminalModes::default());
+        assert!(initialize_staged(&mut guard, ok, ok, ok).is_ok());
+        assert_eq!(guard.modes(), full_modes());
+    }
+
+    #[test]
+    fn staged_init_stops_at_first_failure() {
+        let ok = || Ok(());
+        let fail = || Err(io::Error::other("boom"));
+        // Cursor hide fails: raw + alternate were recorded, cursor was not.
+        let mut guard = TerminalGuard::from_modes_for_test(TerminalModes::default());
+        assert!(initialize_staged(&mut guard, ok, ok, fail).is_err());
+        assert_eq!(
+            guard.modes(),
+            TerminalModes { raw_mode: true, alternate_screen: true, cursor_hidden: false }
+        );
+        // Alternate screen fails: only raw mode was recorded.
+        let mut guard = TerminalGuard::from_modes_for_test(TerminalModes::default());
+        assert!(initialize_staged(&mut guard, ok, fail, ok).is_err());
+        assert_eq!(
+            guard.modes(),
+            TerminalModes { raw_mode: true, alternate_screen: false, cursor_hidden: false }
+        );
+        // Raw mode fails: nothing is recorded.
+        let mut guard = TerminalGuard::from_modes_for_test(TerminalModes::default());
+        assert!(initialize_staged(&mut guard, fail, ok, ok).is_err());
+        assert_eq!(guard.modes(), TerminalModes::default());
+    }
+
+    #[test]
+    fn failed_init_restores_only_succeeded_modes() {
+        // Simulate the `new` contract: a failed init restores the recorded
+        // (partially succeeded) modes and marks the guard restored.
+        let ok = || Ok(());
+        let fail = || Err(io::Error::other("boom"));
+        let mut guard = TerminalGuard::from_modes_for_test(TerminalModes::default());
+        assert!(initialize_staged(&mut guard, ok, ok, fail).is_err());
+        guard.restore();
+        assert!(guard.is_restored());
     }
 
     #[test]

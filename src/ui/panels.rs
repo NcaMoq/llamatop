@@ -369,6 +369,8 @@ fn placeholder(symbols: &Symbols) -> &'static str {
 
 /// Truncate a string to a display width, adding an ellipsis when cut.
 /// Never slices at a UTF-8 byte boundary; ASCII mode uses `...`.
+/// The ellipsis is measured with display width, not UTF-8 byte length
+/// (`…` is 3 bytes but 1 column).
 fn trunc(s: &str, max_width: usize, ascii: bool) -> String {
     if max_width == 0 {
         return String::new();
@@ -377,14 +379,15 @@ fn trunc(s: &str, max_width: usize, ascii: bool) -> String {
         return s.to_string();
     }
     let ellipsis = if ascii { "..." } else { "…" };
-    if max_width <= ellipsis.len() {
+    let ellipsis_width = ellipsis.width();
+    if max_width <= ellipsis_width {
         return ellipsis.to_string();
     }
     let mut out = String::new();
     let mut width = 0;
     for ch in s.chars() {
         let w = ch.width().unwrap_or(0);
-        if width + w > max_width - ellipsis.len() {
+        if width + w > max_width - ellipsis_width {
             break;
         }
         out.push(ch);
@@ -441,5 +444,59 @@ fn update_age(state: &AppState, symbols: &Symbols) -> String {
         Some(ms) if ms < 1000 => format!("{ms} ms ago"),
         Some(ms) if ms < 60_000 => format!("{:.1} s ago", ms as f64 / 1000.0),
         Some(ms) => format!("{} min ago", ms / 60_000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trunc_keeps_short_strings_intact() {
+        assert_eq!(trunc("abc", 10, false), "abc");
+        assert_eq!(trunc("abc", 10, true), "abc");
+    }
+
+    #[test]
+    fn trunc_unicode_uses_display_width_ellipsis() {
+        // Width budget of 5 over "abcdefgh" -> "abcd…" (4 + 1 ellipsis column).
+        let out = trunc("abcdefgh", 5, false);
+        assert_eq!(out, "abcd…");
+        assert_eq!(out.width(), 5, "must not exceed the display width budget");
+        // The ellipsis is a single column, not three bytes.
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    #[test]
+    fn trunc_ascii_mode_uses_ascii_only() {
+        // ASCII ellipsis is 3 columns, so a budget of 5 keeps 2 chars + "...".
+        let out = trunc("abcdefgh", 5, true);
+        assert_eq!(out, "ab...");
+        assert!(out.is_ascii());
+        assert_eq!(out.width(), 5);
+    }
+
+    #[test]
+    fn trunc_does_not_split_cjk_or_emoji_chars() {
+        // CJK chars are 2 columns wide; budget 4 keeps one char + "…",
+        // never a half-char.
+        let out = trunc("日本語テキスト", 4, false);
+        assert_eq!(out, "日…");
+        assert!(out.width() <= 4);
+        // Emoji are 2 columns wide and must never be split.
+        let out = trunc("a🎉a🎉aaaa", 5, false);
+        assert_eq!(out, "a🎉a…");
+        assert_eq!(out.width(), 5);
+    }
+
+    #[test]
+    fn trunc_handles_zero_and_tiny_widths_without_panic() {
+        assert_eq!(trunc("abc", 0, false), "");
+        assert_eq!(trunc("abc", 0, true), "");
+        assert_eq!(trunc("abc", 1, false), "…");
+        assert_eq!(trunc("abcd", 3, true), "...");
+        assert_eq!(trunc("あいう", 1, false), "…");
+        // A string that fits is never truncated.
+        assert_eq!(trunc("abc", 3, true), "abc");
     }
 }

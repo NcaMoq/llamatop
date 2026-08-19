@@ -16,21 +16,17 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::event::{AppEvent, InputAction};
 
 /// Map a raw key event to an application action, if any.
+///
+/// Only keys with an implemented, visible effect are bound. Keys whose
+/// features are not implemented yet (help modal, slot selection, event log,
+/// history clear, panel focus) map to `None` so they cannot change state or
+/// make the TUI look frozen. They are re-enabled when the feature ships.
 pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputAction> {
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(InputAction::Quit),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(InputAction::Quit),
         KeyCode::Char('r') => Some(InputAction::Reconnect),
         KeyCode::Char('p') => Some(InputAction::TogglePause),
-        KeyCode::Char('?') => Some(InputAction::ToggleHelp),
-        KeyCode::Esc => Some(InputAction::CloseModal),
-        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => Some(InputAction::FocusPrev),
-        KeyCode::Tab => Some(InputAction::FocusNext),
-        KeyCode::Up | KeyCode::Char('k') => Some(InputAction::SlotUp),
-        KeyCode::Down | KeyCode::Char('j') => Some(InputAction::SlotDown),
-        KeyCode::Enter => Some(InputAction::ToggleSlotDetail),
-        KeyCode::Char('l') => Some(InputAction::ToggleEvents),
-        KeyCode::Char('c') => Some(InputAction::ClearHistory),
         _ => None,
     }
 }
@@ -111,36 +107,33 @@ mod tests {
             key_to_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(InputAction::Quit)
         );
-        // Plain c clears history, does not quit.
-        assert_eq!(key(KeyCode::Char('c')), Some(InputAction::ClearHistory));
     }
 
     #[test]
-    fn reconnect_pause_help_close_modal() {
+    fn reconnect_and_pause_are_bound() {
         assert_eq!(key(KeyCode::Char('r')), Some(InputAction::Reconnect));
         assert_eq!(key(KeyCode::Char('p')), Some(InputAction::TogglePause));
-        assert_eq!(key(KeyCode::Char('?')), Some(InputAction::ToggleHelp));
-        assert_eq!(key(KeyCode::Esc), Some(InputAction::CloseModal));
     }
 
     #[test]
-    fn tab_and_shift_tab_focus() {
-        assert_eq!(key(KeyCode::Tab), Some(InputAction::FocusNext));
-        assert_eq!(key_to_action(KeyCode::Tab, KeyModifiers::SHIFT), Some(InputAction::FocusPrev));
+    fn help_key_is_not_bound_until_the_modal_exists() {
+        assert_eq!(key(KeyCode::Char('?')), None);
     }
 
     #[test]
-    fn arrow_and_vi_keys_move_selection() {
-        assert_eq!(key(KeyCode::Up), Some(InputAction::SlotUp));
-        assert_eq!(key(KeyCode::Char('k')), Some(InputAction::SlotUp));
-        assert_eq!(key(KeyCode::Down), Some(InputAction::SlotDown));
-        assert_eq!(key(KeyCode::Char('j')), Some(InputAction::SlotDown));
-    }
-
-    #[test]
-    fn enter_l_c_actions() {
-        assert_eq!(key(KeyCode::Enter), Some(InputAction::ToggleSlotDetail));
-        assert_eq!(key(KeyCode::Char('l')), Some(InputAction::ToggleEvents));
+    fn unimplemented_keys_are_ignored() {
+        // No modal, slot table, event log, history clear, or panel focus is
+        // implemented yet, so none of these may map to an action.
+        assert_eq!(key(KeyCode::Esc), None);
+        assert_eq!(key(KeyCode::Tab), None);
+        assert_eq!(key_to_action(KeyCode::Tab, KeyModifiers::SHIFT), None);
+        assert_eq!(key(KeyCode::Up), None);
+        assert_eq!(key(KeyCode::Char('k')), None);
+        assert_eq!(key(KeyCode::Down), None);
+        assert_eq!(key(KeyCode::Char('j')), None);
+        assert_eq!(key(KeyCode::Enter), None);
+        assert_eq!(key(KeyCode::Char('l')), None);
+        assert_eq!(key(KeyCode::Char('c')), None);
     }
 
     #[test]

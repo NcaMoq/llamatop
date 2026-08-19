@@ -41,6 +41,26 @@ pub async fn run(
     let (commands_tx, commands_rx) = unbounded_channel::<CollectorCommand>();
     let collector = tokio::spawn(backend::run(config, events_tx, commands_rx));
 
+    let run_result = run_event_loop(&mut state, &mut events_rx, &commands_tx, &mut draw).await;
+
+    // Mandatory cleanup, independent of how the loop ended: stop the
+    // collector and join it so no detached task survives, even after a
+    // draw/command failure. Cleanup failures are ignored on purpose — the
+    // loop's own error (if any) is what must be reported.
+    let _ = commands_tx.send(CollectorCommand::Stop);
+    let _ = collector.await;
+
+    run_result
+}
+
+/// The event loop body. Returns the exit code, or an error if a command
+/// send or a draw failed. The caller owns collector cleanup.
+async fn run_event_loop(
+    state: &mut AppState,
+    events_rx: &mut UnboundedReceiver<AppEvent>,
+    commands_tx: &UnboundedSender<CollectorCommand>,
+    draw: &mut impl FnMut(&AppState) -> std::io::Result<()>,
+) -> anyhow::Result<i32> {
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -48,16 +68,16 @@ pub async fn run(
         // Drain all immediately-available events before drawing, so the UI
         // catches up after slow collector responses without queuing input.
         while let Ok(event) = events_rx.try_recv() {
-            handle(&mut state, event);
+            handle(state, event);
         }
 
         if !state.should_quit {
             tokio::select! {
                 event = events_rx.recv() => match event {
-                    Some(e) => handle(&mut state, e),
+                    Some(e) => handle(state, e),
                     // All senders dropped (collector + input reader gone):
                     // unrecoverable channel failure; exit cleanly.
-                    None => break,
+                    None => return Ok(0),
                 },
                 _ = tick.tick() => state.on_tick(),
             }
@@ -68,17 +88,11 @@ pub async fn run(
         }
 
         if state.should_quit {
-            commands_tx.send(CollectorCommand::Stop)?;
-            let _ = collector.await;
             return Ok(0);
         }
 
-        draw(&state)?;
+        draw(state)?;
     }
-
-    commands_tx.send(CollectorCommand::Stop)?;
-    let _ = collector.await;
-    Ok(0)
 }
 
 /// Apply one event to the state.
@@ -118,6 +132,29 @@ mod tests {
             .expect("runtime exits within timeout")
             .expect("runtime task does not panic");
         assert_eq!(code.expect("runtime returns Ok"), 0);
+    }
+
+    #[tokio::test]
+    async fn draw_failure_returns_the_error_and_exits() {
+        let config = Config {
+            endpoint: "http://127.0.0.1:1".to_string(), // dead port; no traffic
+            request_timeout_ms: 100,
+            refresh_interval_ms: 100,
+            ..Default::default()
+        };
+        let (events_tx, events_rx) = unbounded_channel();
+        // The draw fails on the first call. The runtime must surface that
+        // error (not mask it with a cleanup error) and terminate promptly
+        // (the collector is stopped and joined, so nothing hangs).
+        let handle = tokio::spawn(run(config, events_tx, events_rx, (80, 20), |_| {
+            Err(std::io::Error::other("draw failed"))
+        }));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("runtime exits within timeout")
+            .expect("runtime task does not panic");
+        let err = result.expect_err("draw error propagates");
+        assert!(err.to_string().contains("draw failed"));
     }
 
     #[test]

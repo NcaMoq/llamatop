@@ -13,6 +13,27 @@ use std::time::Instant;
 /// Upper bound on a plausible token rate; values above are treated as bad data.
 const MAX_PLAUSIBLE_RATE: f64 = 1_000_000.0;
 
+/// One interval's rate measurement.
+///
+/// `raw` is the instantaneous rate for this interval (None on first sample,
+/// reset, or degenerate timing). `smoothed` is a bounded moving average of
+/// recent raw rates (display only — must never drive state detection).
+/// `increased` is true when the counter actually grew in this interval.
+/// `reset` is true when a counter decrease (server restart) was detected.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RateObservation {
+    pub raw: Option<f64>,
+    pub smoothed: Option<f64>,
+    pub increased: bool,
+    pub reset: bool,
+}
+
+impl RateObservation {
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// Computes a rate from two counter samples, with a bounded smoothed view.
 #[derive(Debug, Clone, Default)]
 pub struct RateCalculator {
@@ -35,46 +56,50 @@ impl RateCalculator {
     /// Number of samples kept for the smoothed rate.
     const SMOOTH_WINDOW: usize = 8;
 
-    /// Feed a new counter sample and return `(raw_rate, smoothed_rate)`.
+    /// Feed a new counter sample and return the interval's `RateObservation`.
     ///
-    /// Both are `None` on the first sample, after a reset, or when timing is
+    /// `raw` is None on the first sample, after a reset, or when timing is
     /// degenerate. The counter must be monotonically non-decreasing; a
     /// decrease (server restart / counter reset) discards the previous sample
-    /// and yields `None` for this interval instead of a bogus spike.
-    pub fn update(&mut self, current: Option<u64>, now: Instant) -> (Option<f64>, Option<f64>) {
+    /// and yields a reset observation instead of a bogus spike.
+    pub fn update(&mut self, current: Option<u64>, now: Instant) -> RateObservation {
         match (self.previous.take(), current) {
             (Some(prev), Some(curr)) => {
                 let elapsed = now.duration_since(prev.at);
-                let raw = if elapsed.as_secs_f64() <= 0.0 {
-                    None
-                } else if curr < prev.value {
-                    // Counter reset or server restart: no rate for this interval.
-                    None
-                } else {
-                    let delta = curr.saturating_sub(prev.value) as f64;
-                    let rate = delta / elapsed.as_secs_f64();
-                    if rate.is_finite() && rate <= MAX_PLAUSIBLE_RATE {
-                        Some(rate)
-                    } else {
-                        None
-                    }
-                };
+                if elapsed.as_secs_f64() <= 0.0 {
+                    self.previous = Some(CounterSample { value: curr, at: now });
+                    return RateObservation::none();
+                }
+                if curr < prev.value {
+                    // Counter reset or server restart.
+                    self.previous = Some(CounterSample { value: curr, at: now });
+                    self.recent.clear();
+                    return RateObservation { reset: true, ..Default::default() };
+                }
+
+                let delta = curr.saturating_sub(prev.value) as f64;
+                let rate = delta / elapsed.as_secs_f64();
+                let raw =
+                    if rate.is_finite() && rate <= MAX_PLAUSIBLE_RATE { Some(rate) } else { None };
 
                 self.previous = Some(CounterSample { value: curr, at: now });
 
-                let smoothed = if let Some(r) = raw {
-                    self.recent.push_back(r);
-                    while self.recent.len() > Self::SMOOTH_WINDOW {
-                        self.recent.pop_front();
+                let (smoothed, increased) = match raw {
+                    Some(r) => {
+                        self.recent.push_back(r);
+                        while self.recent.len() > Self::SMOOTH_WINDOW {
+                            self.recent.pop_front();
+                        }
+                        let sum: f64 = self.recent.iter().sum();
+                        (Some(sum / self.recent.len() as f64), r > 0.0)
                     }
-                    let sum: f64 = self.recent.iter().sum();
-                    Some(sum / self.recent.len() as f64)
-                } else {
-                    self.recent.clear();
-                    None
+                    None => {
+                        self.recent.clear();
+                        (None, false)
+                    }
                 };
 
-                (raw, smoothed)
+                RateObservation { raw, smoothed, increased, reset: false }
             }
             _ => {
                 // No usable pair: keep current as the new baseline.
@@ -82,7 +107,7 @@ impl RateCalculator {
                     self.previous = Some(CounterSample { value: curr, at: now });
                 }
                 self.recent.clear();
-                (None, None)
+                RateObservation::none()
             }
         }
     }
@@ -126,9 +151,11 @@ mod tests {
     #[test]
     fn first_sample_has_no_rate() {
         let mut rc = RateCalculator::new();
-        let (raw, smoothed) = rc.update(Some(100), Instant::now());
-        assert_eq!(raw, None);
-        assert_eq!(smoothed, None);
+        let obs = rc.update(Some(100), Instant::now());
+        assert_eq!(obs.raw, None);
+        assert_eq!(obs.smoothed, None);
+        assert!(!obs.increased);
+        assert!(!obs.reset);
     }
 
     #[test]
@@ -137,10 +164,11 @@ mod tests {
         let start = Instant::now();
         rc.update(Some(100), start);
         let later = start + Duration::from_secs(2);
-        let (raw, _) = rc.update(Some(140), later);
+        let obs = rc.update(Some(140), later);
         // 40 tokens / 2s = 20 tok/s (approx; Instant may have advanced)
-        let raw = raw.expect("rate expected");
+        let raw = obs.raw.expect("rate expected");
         assert!((raw - 20.0).abs() < 1.0);
+        assert!(obs.increased);
     }
 
     #[test]
@@ -149,14 +177,17 @@ mod tests {
         let start = Instant::now();
         rc.update(Some(1000), start);
         let later = start + Duration::from_millis(500);
-        let (raw, smoothed) = rc.update(Some(5), later);
-        assert_eq!(raw, None);
-        assert_eq!(smoothed, None);
+        let obs = rc.update(Some(5), later);
+        assert_eq!(obs.raw, None);
+        assert_eq!(obs.smoothed, None);
+        assert!(obs.reset);
+        assert!(!obs.increased);
 
         // Next interval works normally from the reset baseline.
         let later2 = later + Duration::from_secs(1);
-        let (raw2, _) = rc.update(Some(15), later2);
-        assert_eq!(raw2, Some(10.0));
+        let obs2 = rc.update(Some(15), later2);
+        assert_eq!(obs2.raw, Some(10.0));
+        assert!(obs2.increased);
     }
 
     #[test]
@@ -164,8 +195,8 @@ mod tests {
         let mut rc = RateCalculator::new();
         let start = Instant::now();
         rc.update(Some(10), start);
-        let (raw, _) = rc.update(None, start + Duration::from_secs(1));
-        assert_eq!(raw, None);
+        let obs = rc.update(None, start + Duration::from_secs(1));
+        assert_eq!(obs.raw, None);
     }
 
     #[test]
@@ -173,8 +204,8 @@ mod tests {
         let mut rc = RateCalculator::new();
         let t = Instant::now();
         rc.update(Some(10), t);
-        let (raw, _) = rc.update(Some(20), t);
-        assert_eq!(raw, None);
+        let obs = rc.update(Some(20), t);
+        assert_eq!(obs.raw, None);
     }
 
     #[test]
@@ -182,11 +213,12 @@ mod tests {
         let mut rc = RateCalculator::new();
         let start = Instant::now();
         rc.update(Some(0), start);
-        let (r1, _) = rc.update(Some(10), start + Duration::from_secs(1));
-        let (r2, s2) = rc.update(Some(30), start + Duration::from_secs(2));
-        assert!(r1.is_some() && r2.is_some() && s2.is_some());
-        let s2 = s2.unwrap();
-        let expected = (r1.unwrap() + r2.unwrap()) / 2.0;
+        let r1 = rc.update(Some(10), start + Duration::from_secs(1));
+        let obs2 = rc.update(Some(30), start + Duration::from_secs(2));
+        let r2 = obs2.raw.expect("raw rate");
+        assert!(r1.raw.is_some() && obs2.raw.is_some());
+        let s2 = obs2.smoothed.expect("smoothed");
+        let expected = (r1.raw.unwrap() + r2) / 2.0;
         assert!((s2 - expected).abs() < 1e-6);
     }
 
@@ -196,8 +228,8 @@ mod tests {
         let start = Instant::now();
         rc.update(Some(100), start);
         rc.reset();
-        let (raw, _) = rc.update(Some(110), start + Duration::from_secs(1));
-        assert_eq!(raw, None);
+        let obs = rc.update(Some(110), start + Duration::from_secs(1));
+        assert_eq!(obs.raw, None);
     }
 
     #[test]
@@ -207,5 +239,15 @@ mod tests {
         assert_eq!(rate_between(None, Some(110), Some(Duration::from_secs(2))), None);
         assert_eq!(rate_between(Some(100), None, Some(Duration::from_secs(2))), None);
         assert_eq!(rate_between(Some(100), Some(110), None), None);
+    }
+
+    #[test]
+    fn no_increase_when_counter_unchanged() {
+        let mut rc = RateCalculator::new();
+        let start = Instant::now();
+        rc.update(Some(100), start);
+        let obs = rc.update(Some(100), start + Duration::from_secs(1));
+        assert_eq!(obs.raw, Some(0.0));
+        assert!(!obs.increased);
     }
 }

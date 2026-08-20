@@ -617,4 +617,34 @@ mod tests {
         let _ = render_content(&state, false, 62, 16);
         let _ = render_content(&state, false, 1, 1);
     }
+
+    #[test]
+    fn slot_table_at_80x20_shows_header_and_row_with_metrics_warning() {
+        // /slots available, /metrics unavailable: the warning lines render
+        // below the table and must not hide the table header or the slot
+        // row at the minimum terminal size.
+        let mut state = connected_ready(|s| {
+            s.slots = vec![slot(137, true, Some(8_192))];
+        });
+        state.apply_capabilities(crate::backend::BackendCapabilities {
+            slots: true,
+            metrics: false,
+            ..Default::default()
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Metrics unavailable"), "warning must render");
+        assert!(!content.contains("Slots unavailable"), "capability is on");
+        let lines = split_rows(&content, 80);
+        assert!(
+            lines.iter().any(|l| l.contains("ID")
+                && l.contains("State")
+                && l.contains("Phase")
+                && l.contains("Context")),
+            "the slot table header row must be visible at 80x20"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("137") && l.contains("DECODE")),
+            "the slot's row (ID + phase) must be visible at 80x20"
+        );
+    }
 }

@@ -3,42 +3,61 @@
 A Windows-native terminal monitor for [llama.cpp](https://github.com/ggml-org/llama.cpp)
 `llama-server`. It observes server state, per-slot workload phase, and
 throughput, without ever requesting, storing, or displaying prompt or
-completion text, and without ever displaying or logging API keys. NVIDIA GPU
-metrics (and CPU/RAM monitoring) are planned, not yet implemented.
+completion text, and without ever displaying or logging API keys. It also
+monitors host CPU/RAM, the `llama-server` process, and (optionally) NVIDIA
+GPUs via NVML.
 
 ## Status
 
-This build provides the monitoring core, the non-interactive commands, and a
-basic interactive TUI:
+v0.1 release candidate. This build provides the monitoring core, the
+non-interactive commands, and a full interactive TUI:
 
 - `llamatop doctor` — environment and server connectivity check
 - `llamatop snapshot` — one-shot capture (human-readable or pure JSON)
-- `llamatop` (no subcommand) — interactive TUI with a header panel
-  (connection, backend, model, server state, workload phase, active/queued
-  requests, update age), an inference panel (prompt/generation throughput,
-  active/queued, context size, slot count, speculative acceptance rate), and
-  a slot monitoring table (stable ID order, slot selection, vertical
-  scrolling, and responsive columns: wide/standard/compact by terminal
-  width)
+- `llamatop` (no subcommand) — interactive TUI:
+  - a **header** panel (connection, backend, model, server state, workload
+    phase, active/queued requests, update age),
+  - an **inference** panel (prompt/generation throughput, active/queued,
+    context size, slot count, speculative acceptance rate),
+  - a **slot** table (stable ID order, slot selection, vertical scrolling,
+    and responsive columns: wide/standard/compact by terminal width),
+  - a **history** panel (time-series sparklines/bars for prompt, generation,
+    active, and queued; bounded by `history_seconds`),
+  - an **event log** panel (connection, server-state, phase, capability,
+    reconnect, and pause events; bounded, with repeat collapsing), and
+  - a **Resources** panel (host CPU/RAM, the `llama-server` process when it
+    can be identified, and one row per NVIDIA GPU).
 
-TUI controls: `q` quit, `r` reconnect, `p` pause/resume, and `↑`/`↓` (or
-`j`/`k`) to move the slot selection. The slot keys are advertised in the
-footer only when the `/slots` endpoint is available and at least one slot is
-reported; "Slots unavailable" (endpoint absent) and "No slots reported"
-(zero slots) are distinct views. The terminal must be at least 80x20; smaller
-windows show a "too small" notice. Missing values are rendered as a
-placeholder, never as 0. `--ascii` forces an ASCII-only rendering. The slot
-detail view, history graphs, the event log, GPU/system monitoring, and the
-help modal are not yet implemented.
+TUI controls: `q` quit, `r` reconnect, `p` pause/resume, `l` toggle the event
+log, `c` clear the event log (or the history when it is hidden),
+PageUp/PageDown/Home/End to scroll the event log, and `↑`/`↓` (or `j`/`k`) to
+move the slot selection. `?` opens a help modal (Esc closes it); `q` does not
+quit while the modal is open. The slot keys are advertised in the footer only
+when the `/slots` endpoint is available and at least one slot is reported;
+"Slots unavailable" (endpoint absent) and "No slots reported" (zero slots)
+are distinct views. The terminal must be at least 80x20; smaller windows show
+a "too small" notice. Missing values are rendered as a placeholder, never as
+0. `--ascii` forces an ASCII-only rendering.
+
+The Resources panel has the lowest layout priority, so it appears only when
+the terminal is tall enough (for example, roughly 100x31 or larger) and the
+full history still fits; at 80x20 and 100x30 it is hidden so the slot table
+and history keep their rows. A per-GPU row shows utilization, VRAM
+used/total, temperature, and power — it never claims that a GPU belongs to
+the `llama-server` process, and with several matching processes the endpoint
+association is reported as unknown. The slot detail view is not yet
+implemented.
 
 ## Requirements
 
 - Windows (x86_64), Rust stable (MSVC toolchain) for building
 - A running `llama-server` (any recent llama.cpp build)
+- (Optional) an NVIDIA GPU with a current driver for GPU monitoring
 
-No Python, Node.js, Docker, or WSL is required. Planned GPU monitoring will
-use NVIDIA NVML when the driver is present and degrade to a warning (never a
-crash) when NVML or a GPU is unavailable.
+No Python, Node.js, Docker, or WSL is required. GPU monitoring uses NVIDIA
+NVML when the driver is present and degrades to a warning (never a crash or
+a startup failure) when NVML or a GPU is unavailable. `--no-gpu` disables GPU
+monitoring and `--no-system` disables host + process monitoring.
 
 ## Building
 
@@ -57,14 +76,15 @@ Commands:
   snapshot  Capture a single snapshot and exit
 
 Options:
-      --endpoint <URL>    llama-server URL (default: http://127.0.0.1:8080)
-      --ascii             ASCII-only output (no Unicode symbols)
-      --no-gpu            Disable GPU monitoring
-      --refresh-ms <MS>   Snapshot refresh interval in milliseconds (minimum 100)
-      --verbose           Increase log verbosity (info level)
-      --debug             Debug logging (details go to the log file)
-  -h, --help              Help
-  -V, --version           Version
+      --endpoint <URL>   Endpoint URL of the llama-server to monitor (default: http://127.0.0.1:8080)
+      --ascii            Use ASCII-only characters in output (no Unicode symbols)
+      --no-gpu           Disable GPU monitoring
+      --no-system        Disable host + llama-server process monitoring
+      --refresh-ms <MS>  Snapshot refresh interval in milliseconds (minimum: 100)
+      --verbose          Increase log verbosity (info level)
+      --debug            Enable debug logging (writes full details to the log file)
+  -h, --help             Print help
+  -V, --version          Print version
 ```
 
 Examples:
@@ -100,6 +120,7 @@ built-in defaults.
 | `refresh_interval_ms` | `500` | Minimum 100 |
 | `ascii` | `false` | Force ASCII output |
 | `show_gpu` | `true` | GPU monitoring |
+| `show_system` | `true` | Host CPU/RAM and `llama-server` process monitoring |
 | `history_seconds` | `120` | 10..=3600 |
 | `authentication.api_key_env` | `LLAMATOP_API_KEY` | Name of the env var holding the API key |
 | `gpu.backend` | `auto` | `auto`, `nvml`, or `none` |
@@ -134,8 +155,11 @@ distinguishable from `0`. Example:
 
 Fields present when the server reports them: `active_requests`,
 `queued_requests`, `context_max_tokens`, `prompt_tokens_per_second`,
-`generation_tokens_per_second`, `gpu[]`, `slots[]`. Throughput falls back to
-the server-reported cumulative average when no local delta is available.
+`generation_tokens_per_second`, `slots[]`. The `gpu[]` field is part of the
+schema but is always omitted by `snapshot --json`: GPU metrics are sampled
+live by the TUI's NVML monitor and are never fetched from the server.
+Throughput falls back to the server-reported cumulative average when no local
+delta is available.
 
 ## What it monitors (and does not)
 

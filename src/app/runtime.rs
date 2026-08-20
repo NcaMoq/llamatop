@@ -44,7 +44,8 @@ pub async fn run(
     // on the same event channel, so it must be stopped before the loop's
     // receiver can see "all senders dropped". Disabled by config.
     let system_monitor = if config.show_system {
-        let provider = system_monitor::shared(system_monitor::SysinfoProvider::new());
+        let provider =
+            system_monitor::shared(system_monitor::SysinfoProvider::new(&config.endpoint));
         Some(system_monitor::start(
             provider,
             events_tx.clone(),

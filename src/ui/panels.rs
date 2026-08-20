@@ -20,8 +20,8 @@ use crate::app::log::{EventRecord, EventSeverity};
 use crate::app::state::AppState;
 use crate::display::Symbols;
 use crate::domain::{
-    BackendSnapshot, Confidence, ConnectionState, GpuMonitorStatus, GpuSnapshot, ServerState,
-    SlotSnapshot, SystemSnapshot,
+    BackendSnapshot, Confidence, ConnectionState, GpuMonitorStatus, GpuSnapshot,
+    ProcessAssociation, ProcessSnapshot, ServerState, SlotSnapshot, SystemSnapshot,
 };
 
 /// Minimum size at which the full panel layout is rendered.
@@ -520,10 +520,11 @@ fn severity_symbol(severity: EventSeverity, symbols: &Symbols) -> &'static str {
 
 /// Resources panel (Phase D): host CPU/RAM and the llama-server process.
 ///
-/// Missing values render as the placeholder, never 0. The process row is
-/// only shown when exactly one candidate matched (`identity == Exact`);
-/// with several candidates the endpoint association is not confirmed, so the
-/// panel reports the candidate count instead of naming a process.
+/// Missing values render as the placeholder, never 0. The process row never
+/// claims an endpoint association from a name match: a single local
+/// candidate is labeled "endpoint not verified", several candidates are
+/// counted without naming one, and a remote endpoint shows that local
+/// process association is unavailable.
 fn render_resources(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
     let block = Block::bordered().title(" Resources ");
     let inner = block.inner(area);
@@ -675,31 +676,55 @@ fn ram_display(used: Option<u64>, total: Option<u64>, symbols: &Symbols) -> Stri
     }
 }
 
-/// The llama-server process row. Never claims an endpoint association for a
-/// process we cannot confirm is the server.
+/// The llama-server process row. A name match never claims an endpoint
+/// association: a single candidate is labeled "not verified", several
+/// candidates are counted without naming one, and a remote endpoint shows
+/// that no local process is the monitored server.
 fn process_line(sys: &SystemSnapshot, symbols: &Symbols) -> String {
-    match (&sys.process, sys.process_match_count) {
-        (Some(p), _) => {
-            let cpu = format_percent_value(p.cpu_usage_percent, symbols);
-            let mem = match p.memory_bytes {
-                Some(m) => bytes(m),
-                None => placeholder(symbols).to_string(),
-            };
-            let up = match p.uptime_secs {
-                Some(s) => human_secs(s),
-                None => placeholder(symbols).to_string(),
-            };
-            format!("{} {} CPU {} Mem {} Up {}", symbols.active(), p.name, cpu, mem, up)
+    let metrics = |p: &ProcessSnapshot| {
+        let cpu = format_percent_value(p.cpu_usage_percent, symbols);
+        let mem = match p.memory_bytes {
+            Some(m) => bytes(m),
+            None => placeholder(symbols).to_string(),
+        };
+        let up = match p.uptime_secs {
+            Some(s) => human_secs(s),
+            None => placeholder(symbols).to_string(),
+        };
+        format!("CPU {cpu} Mem {mem} Up {up}")
+    };
+    match (sys.association, &sys.process) {
+        (ProcessAssociation::Verified, Some(p)) => {
+            format!("{} {} {}", symbols.active(), p.name, metrics(p))
         }
-        // Several candidates: we cannot say which one the endpoint is.
-        (None, Some(n)) if n > 1 => {
-            format!("{} {n} llama-server processes; endpoint not associated", symbols.warning())
+        // A single local name match: show its metrics, but make clear the
+        // endpoint association is not verified.
+        (ProcessAssociation::SingleLocalCandidate, Some(p)) => {
+            format!(
+                "{} 1 local llama-server candidate (endpoint not verified) PID {} {} {}",
+                symbols.warning(),
+                p.pid,
+                p.name,
+                metrics(p)
+            )
         }
-        // No matching process (0, or a defensive 1 with no process record):
-        // HTTP monitoring continues; the process row is a neutral note.
-        (None, Some(_)) => "llama-server process not found".to_string(),
-        // The process list could not be read at all.
-        (None, None) => "llama-server process: unavailable".to_string(),
+        // Defensive: a verified/candidate association without a process
+        // record falls back to a neutral note.
+        (ProcessAssociation::Verified | ProcessAssociation::SingleLocalCandidate, None) => {
+            "llama-server process not found".to_string()
+        }
+        (ProcessAssociation::MultipleLocalCandidates, _) => {
+            let n = sys.process_match_count.unwrap_or(0);
+            format!(
+                "{} {n} local llama-server candidates; endpoint not associated",
+                symbols.warning()
+            )
+        }
+        (ProcessAssociation::NoneFound, _) => "llama-server process not found".to_string(),
+        (ProcessAssociation::RemoteEndpoint, _) => {
+            "Remote endpoint; local process association unavailable".to_string()
+        }
+        (ProcessAssociation::Unavailable, _) => "llama-server process: unavailable".to_string(),
     }
 }
 
@@ -1209,7 +1234,7 @@ fn update_age(state: &AppState, symbols: &Symbols) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ProcessIdentity, ProcessSnapshot};
+    use crate::domain::{ProcessAssociation, ProcessSnapshot};
 
     #[test]
     fn trunc_keeps_short_strings_intact() {
@@ -1326,57 +1351,93 @@ mod tests {
         assert_eq!(ram_display(Some(50), Some(0), &sym), "—");
     }
 
-    #[test]
-    fn process_line_never_fabricates_association() {
-        let sym = Symbols::new(false);
-        // Exactly one match: the process is shown.
-        let snap = SystemSnapshot {
+    fn empty_system() -> SystemSnapshot {
+        SystemSnapshot {
             cpu_usage_percent: None,
             ram_used_bytes: None,
             ram_total_bytes: None,
-            process_match_count: Some(1),
-            process: Some(ProcessSnapshot {
-                pid: 42,
-                name: "llama-server.exe".into(),
-                cpu_usage_percent: Some(9.0),
-                memory_bytes: Some(29_650_837_504),
-                uptime_secs: Some(8372),
-                identity: ProcessIdentity::Exact,
-            }),
-        };
+            process: None,
+            process_match_count: None,
+            association: ProcessAssociation::NoneFound,
+        }
+    }
+
+    fn candidate_process() -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid: 42,
+            name: "llama-server.exe".into(),
+            cpu_usage_percent: Some(9.0),
+            memory_bytes: Some(29_650_837_504),
+            uptime_secs: Some(8372),
+        }
+    }
+
+    #[test]
+    fn process_line_single_candidate_is_not_labeled_verified() {
+        let sym = Symbols::new(false);
+        let mut snap = empty_system();
+        snap.process_match_count = Some(1);
+        snap.process = Some(candidate_process());
+        snap.association = ProcessAssociation::SingleLocalCandidate;
         let line = process_line(&snap, &sym);
         assert!(line.contains("llama-server.exe"));
+        assert!(line.contains("PID 42"));
         assert!(line.contains("27.6G"), "process memory is GiB: {line}");
-        assert!(!line.contains("not associated"), "a single exact match is not ambiguous");
+        assert!(
+            line.contains("endpoint not verified"),
+            "a name match must not claim a verified association: {line}"
+        );
+        assert!(!line.contains("Exact"), "no 'exact' label for an unverified candidate");
+    }
 
-        // Several candidates: no process is named.
-        let multi = SystemSnapshot {
-            process_match_count: Some(3),
-            process: None,
-            ..SystemSnapshot {
-                cpu_usage_percent: None,
-                ram_used_bytes: None,
-                ram_total_bytes: None,
-                process: None,
-                process_match_count: None,
-            }
-        };
-        let line = process_line(&multi, &sym);
-        assert!(line.contains("3 llama-server processes"));
+    #[test]
+    fn process_line_verified_association_is_labeled_as_the_server() {
+        let sym = Symbols::new(false);
+        let mut snap = empty_system();
+        snap.process_match_count = Some(1);
+        snap.process = Some(candidate_process());
+        snap.association = ProcessAssociation::Verified;
+        let line = process_line(&snap, &sym);
+        assert!(line.contains("llama-server.exe"));
+        assert!(!line.contains("not verified"), "verified has no caveat: {line}");
+    }
+
+    #[test]
+    fn process_line_multiple_candidates_name_no_process() {
+        let sym = Symbols::new(false);
+        let mut snap = empty_system();
+        snap.process_match_count = Some(3);
+        snap.association = ProcessAssociation::MultipleLocalCandidates;
+        let line = process_line(&snap, &sym);
+        assert!(line.contains("3 local llama-server candidates"));
         assert!(line.contains("not associated"));
-        assert!(!line.contains("llama-server.exe"), "no candidate is named");
+        assert!(!line.contains("PID"), "no candidate is named or PIDs shown");
+    }
 
-        // Zero matches: neutral note.
-        let none = SystemSnapshot {
-            process_match_count: Some(0),
-            ..SystemSnapshot {
-                cpu_usage_percent: None,
-                ram_used_bytes: None,
-                ram_total_bytes: None,
-                process: None,
-                process_match_count: None,
-            }
-        };
-        assert_eq!(process_line(&none, &sym), "llama-server process not found");
+    #[test]
+    fn process_line_none_found_is_neutral() {
+        let sym = Symbols::new(false);
+        let mut snap = empty_system();
+        snap.process_match_count = Some(0);
+        assert_eq!(process_line(&snap, &sym), "llama-server process not found");
+    }
+
+    #[test]
+    fn process_line_remote_endpoint_never_names_a_local_process() {
+        let sym = Symbols::new(false);
+        let mut snap = empty_system();
+        snap.association = ProcessAssociation::RemoteEndpoint;
+        let line = process_line(&snap, &sym);
+        assert!(line.contains("Remote endpoint"));
+        assert!(line.contains("local process association unavailable"));
+        assert!(!line.contains("llama-server.exe"));
+    }
+
+    #[test]
+    fn process_line_unavailable_when_process_list_unreadable() {
+        let sym = Symbols::new(false);
+        let mut snap = empty_system();
+        snap.association = ProcessAssociation::Unavailable;
+        assert_eq!(process_line(&snap, &sym), "llama-server process: unavailable");
     }
 }

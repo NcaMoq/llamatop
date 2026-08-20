@@ -919,6 +919,7 @@ mod tests {
             ram_total_bytes: Some(200),
             process_match_count: Some(1),
             process: None,
+            association: crate::domain::ProcessAssociation::SingleLocalCandidate,
         });
         assert!(s.system.is_some());
         assert_eq!(s.system.as_ref().unwrap().cpu_usage_percent, Some(3.0));

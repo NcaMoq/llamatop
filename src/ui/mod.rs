@@ -1183,7 +1183,7 @@ mod tests {
 
     // --- Step 8: Resources panel tests ---
 
-    use crate::domain::{ProcessIdentity, ProcessSnapshot};
+    use crate::domain::{ProcessAssociation, ProcessSnapshot};
 
     /// Connected/slots state with a controlled host + process sample.
     fn state_with_system(sys: crate::domain::SystemSnapshot) -> AppState {
@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn resources_panel_renders_host_and_process() {
+    fn resources_panel_single_candidate_shows_unverified() {
         let state = state_with_system(crate::domain::SystemSnapshot {
             cpu_usage_percent: Some(42.0),
             ram_used_bytes: Some(16_000_000_000),
@@ -1206,18 +1206,21 @@ mod tests {
                 cpu_usage_percent: Some(9.0),
                 memory_bytes: Some(29_650_837_504),
                 uptime_secs: Some(8372),
-                identity: ProcessIdentity::Exact,
             }),
+            association: ProcessAssociation::SingleLocalCandidate,
         });
-        let content = render_content(&state, false, 100, 40);
+        // 120x40: the candidate row is long, so a wider terminal keeps it
+        // whole (the 100x40 Resources panel inner width would clip it).
+        let content = render_content(&state, false, 120, 40);
         assert!(content.contains("Resources"), "panel title must render");
         assert!(content.contains("CPU 42.0%"), "host CPU shown");
         assert!(content.contains("14.9G/59.6G"), "RAM used/total compact");
-        assert!(content.contains("llama-server.exe"), "the exact process is named");
+        assert!(content.contains("llama-server.exe"), "the candidate process is named");
+        assert!(content.contains("PID 6348"), "candidate PID shown");
         assert!(content.contains("27.6G"), "process memory compact (GiB)");
         assert!(content.contains("2 h"), "uptime human-formatted");
-        // No ambiguous-association wording for a single exact match.
-        assert!(!content.contains("not associated"));
+        // A name match must not be presented as a verified association.
+        assert!(content.contains("endpoint not verified"));
     }
 
     #[test]
@@ -1228,10 +1231,26 @@ mod tests {
             ram_total_bytes: Some(2_000),
             process_match_count: Some(2),
             process: None,
+            association: ProcessAssociation::MultipleLocalCandidates,
         });
         let content = render_content(&state, false, 100, 40);
-        assert!(content.contains("2 llama-server processes"));
+        assert!(content.contains("2 local llama-server candidates"));
         assert!(content.contains("not associated"));
+    }
+
+    #[test]
+    fn resources_panel_remote_endpoint_notes_unavailable() {
+        let state = state_with_system(crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(10.0),
+            ram_used_bytes: Some(1_000),
+            ram_total_bytes: Some(2_000),
+            process_match_count: None,
+            process: None,
+            association: ProcessAssociation::RemoteEndpoint,
+        });
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("Remote endpoint"));
+        assert!(content.contains("local process association unavailable"));
     }
 
     #[test]
@@ -1245,6 +1264,7 @@ mod tests {
             ram_total_bytes: None,
             process_match_count: Some(1),
             process: None,
+            association: ProcessAssociation::SingleLocalCandidate,
         });
         let content = render_content(&state, false, 100, 40);
         assert!(!content.contains("Resources"), "panel hidden when disabled");
@@ -1268,6 +1288,7 @@ mod tests {
             ram_total_bytes: None, // total missing -> placeholder
             process_match_count: Some(0),
             process: None,
+            association: ProcessAssociation::NoneFound,
         });
         let content = render_content(&state, false, 100, 40);
         // CPU missing -> placeholder, RAM missing total -> placeholder.
@@ -1285,6 +1306,7 @@ mod tests {
             ram_total_bytes: Some(2),
             process_match_count: Some(1),
             process: None,
+            association: ProcessAssociation::SingleLocalCandidate,
         });
         let _ = render_content(&state, false, 80, 20);
         let _ = render_content(&state, false, 1, 1);
@@ -1328,6 +1350,7 @@ mod tests {
             ram_total_bytes: Some(20_000),
             process_match_count: Some(0),
             process: None,
+            association: ProcessAssociation::NoneFound,
         }
     }
 

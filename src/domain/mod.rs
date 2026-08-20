@@ -17,4 +17,4 @@ pub use inference::{Confidence, WorkloadPhase};
 pub use server::ServerState;
 pub use slot::{SlotPhase, SlotSnapshot};
 pub use snapshot::{BackendSnapshot, SpeculativeStats};
-pub use system::{ProcessIdentity, ProcessSnapshot, SystemSnapshot};
+pub use system::{ProcessAssociation, ProcessSnapshot, SystemSnapshot};

@@ -44,9 +44,12 @@ the terminal is tall enough (for example, roughly 100x31 or larger) and the
 full history still fits; at 80x20 and 100x30 it is hidden so the slot table
 and history keep their rows. A per-GPU row shows utilization, VRAM
 used/total, temperature, and power — it never claims that a GPU belongs to
-the `llama-server` process, and with several matching processes the endpoint
-association is reported as unknown. The slot detail view is not yet
-implemented.
+the `llama-server` process. The panel does not claim that a local process
+belongs to the configured endpoint unless the association is verified: a
+single matching local process is shown as a candidate labeled "endpoint not
+verified", several matches are counted without naming one, and a non-local
+endpoint (e.g. `http://192.168.1.50:8080`) reports that local process
+association is unavailable. The slot detail view is not yet implemented.
 
 ## Requirements
 

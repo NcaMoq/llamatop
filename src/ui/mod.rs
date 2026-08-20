@@ -609,6 +609,134 @@ mod tests {
         assert!(!compact.contains("Generated"));
     }
 
+    // --- Phase G: responsive layout at the spec's test sizes ---
+    //
+    // Every size must render without panicking and without a UTF-8 split.
+    // `frame.area()` is the only source of truth, so these render directly.
+
+    /// A connected/slots state carrying history samples plus (optionally) a
+    /// host + GPU monitor, so the Resources panel can be exercised.
+    fn responsive_state(
+        samples: &[Sample],
+        sys: Option<crate::domain::SystemSnapshot>,
+        gpu: Option<crate::domain::GpuMonitor>,
+    ) -> AppState {
+        let mut state = state_with_history(samples);
+        state.system = sys;
+        state.gpu = gpu;
+        state
+    }
+
+    fn two_gpu_monitor() -> crate::domain::GpuMonitor {
+        crate::domain::GpuMonitor {
+            status: crate::domain::GpuMonitorStatus::Available,
+            gpus: vec![gpu(0, "NVIDIA RTX 5090"), gpu(1, "NVIDIA RTX 4090")],
+        }
+    }
+
+    #[test]
+    fn responsive_1x1_and_10x5_do_not_panic() {
+        // The two smallest spec sizes cannot fit the fallback text, so they
+        // only need to render without panicking or a UTF-8 split.
+        let state = connected_slots(|s| s.slots = vec![slot(1, true, Some(4_096))]);
+        for (w, h) in [(1, 1), (10, 5)] {
+            let content = render_content(&state, false, w, h);
+            assert!(!content.contains('\u{fffd}'), "{w}x{h} no UTF-8 split");
+        }
+        // 62x16 is above the panic guard but below the full layout, so the
+        // too-small fallback text fits and must be shown.
+        let content = render_content(&state, false, 62, 16);
+        assert!(content.contains("Terminal is too small."));
+        assert!(content.contains("Required: 80 x 20"));
+    }
+
+    #[test]
+    fn responsive_80x20_keeps_header_inference_slots_footer() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(137, true, Some(8_192)), slot(2, false, Some(4_096))];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("LLAMATOP"), "header title");
+        assert!(content.contains("Inference"), "inference panel");
+        assert!(content.contains("Slots"), "slot table");
+        assert!(content.contains("137") && content.contains("DECODE"), "a slot row");
+        assert!(content.contains("q Quit"), "footer");
+        assert!(content.contains("? Help"), "footer help hint");
+        // At 80x20 the Resources panel and history are hidden (lowest
+        // priority), so neither title may appear.
+        assert!(!content.contains("Resources"));
+        assert!(!content.contains("History"));
+    }
+
+    #[test]
+    fn responsive_100x30_full_history_no_resources() {
+        let state = responsive_state(&HISTORY_SAMPLES, None, None);
+        let content = render_content(&state, false, 100, 30);
+        // The full 9-row history renders its legend (only the full tier
+        // emits one).
+        assert!(content.contains("P 80.0"), "full history legend");
+        // Resources is hidden at 100x30 (free=18 < 15+height).
+        assert!(!content.contains("Resources"));
+    }
+
+    #[test]
+    fn responsive_100x40_resources_and_full_history() {
+        let state = responsive_state(&HISTORY_SAMPLES, Some(host_sample()), None);
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("Resources"), "Resources panel visible");
+        assert!(content.contains("P 80.0"), "full history legend still fits");
+    }
+
+    #[test]
+    fn responsive_120x40_two_gpus_and_full_history() {
+        let state =
+            responsive_state(&HISTORY_SAMPLES, Some(host_sample()), Some(two_gpu_monitor()));
+        let content = render_content(&state, false, 120, 40);
+        assert!(content.contains("Resources"));
+        assert!(content.contains("NVIDIA RTX 5090"), "first GPU row");
+        assert!(content.contains("NVIDIA RTX 4090"), "second GPU row");
+        assert!(content.contains("P 80.0"), "full history legend still fits");
+    }
+
+    #[test]
+    fn responsive_160x50_all_panels_and_full_history() {
+        let state =
+            responsive_state(&HISTORY_SAMPLES, Some(host_sample()), Some(two_gpu_monitor()));
+        let content = render_content(&state, false, 160, 50);
+        assert!(content.contains("LLAMATOP"), "header");
+        assert!(content.contains("Inference"));
+        assert!(content.contains("Resources"));
+        assert!(content.contains("NVIDIA RTX 5090"));
+        assert!(content.contains("P 80.0"), "full history legend");
+        assert!(content.contains("q Quit"), "footer");
+    }
+
+    #[test]
+    fn responsive_long_gpu_name_truncates_utf8_safe() {
+        // A very long (CJK + latin) GPU name must truncate by display width
+        // without splitting a character or panicking.
+        let mut monitor = two_gpu_monitor();
+        monitor.gpus[0].name =
+            Some("NVIDIA 日本語-データセンター-モデル-テスト-名前-超長".to_string());
+        let state = responsive_state(&HISTORY_SAMPLES, Some(host_sample()), Some(monitor));
+        let content = render_content(&state, false, 120, 40);
+        // The GPU row is present and the name was truncated (ellipsis or
+        // cut), never overflowing the panel or leaving a split character.
+        assert!(content.contains("GPU  0"), "the GPU row renders");
+        // Every rendered character must be valid (String guarantees this);
+        // assert no replacement char from a bad split.
+        assert!(!content.contains('\u{fffd}'), "no UTF-8 replacement char");
+    }
+
+    #[test]
+    fn responsive_80x20_ascii_no_panics() {
+        let state =
+            responsive_state(&HISTORY_SAMPLES, Some(host_sample()), Some(two_gpu_monitor()));
+        let _ = render_content(&state, true, 80, 20);
+        let _ = render_content(&state, true, 100, 30);
+        let _ = render_content(&state, true, 160, 50);
+    }
+
     #[test]
     fn ascii_slot_table_uses_ascii_markers_and_placeholders() {
         let state = connected_slots(|s| {

@@ -44,7 +44,7 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
             ])
             .split(area);
             render_waiting(f, chunks[0], &state.endpoint, symbols);
-            render_footer(f, chunks[2], symbols);
+            render_footer(f, chunks[2], state);
         }
         Some(s) => {
             match (s.connection, s.server) {
@@ -68,7 +68,7 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                         }
                         _ => {}
                     }
-                    render_footer(f, chunks[2], symbols);
+                    render_footer(f, chunks[2], state);
                 }
                 // Header: border + 3 content lines. Inference: border + 4 lines.
                 _ => {
@@ -90,7 +90,7 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                         }
                         _ => render_connection_view(f, chunks[1], state, s, symbols),
                     }
-                    render_footer(f, chunks[2], symbols);
+                    render_footer(f, chunks[2], state);
                 }
             }
         }
@@ -312,12 +312,20 @@ fn render_connection_view(
     f.render_widget(text, area);
 }
 
-/// Footer: only keys that are actually implemented are advertised.
-fn render_footer(f: &mut Frame, area: Rect, _symbols: &Symbols) {
+/// Footer: only keys that are actually available right now are advertised.
+/// `p` appears once a snapshot exists (pause is ignored before that), and
+/// reads "Resume" while paused so the label matches the action it triggers.
+fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let text = Paragraph::new(" q Quit   r Reconnect   p Pause ").alignment(Alignment::Center);
+    let footer = if state.can_pause() {
+        let action = if state.paused { "p Resume" } else { "p Pause" };
+        format!(" q Quit   r Reconnect   {action} ")
+    } else {
+        " q Quit   r Reconnect ".to_string()
+    };
+    let text = Paragraph::new(footer).alignment(Alignment::Center);
     f.render_widget(text, area);
 }
 
@@ -370,7 +378,8 @@ fn placeholder(symbols: &Symbols) -> &'static str {
 /// Truncate a string to a display width, adding an ellipsis when cut.
 /// Never slices at a UTF-8 byte boundary; ASCII mode uses `...`.
 /// The ellipsis is measured with display width, not UTF-8 byte length
-/// (`…` is 3 bytes but 1 column).
+/// (`…` is 3 bytes but 1 column). The result always satisfies
+/// `width(result) <= max_width`, including tiny budgets (width 0/1/2).
 fn trunc(s: &str, max_width: usize, ascii: bool) -> String {
     if max_width == 0 {
         return String::new();
@@ -379,21 +388,30 @@ fn trunc(s: &str, max_width: usize, ascii: bool) -> String {
         return s.to_string();
     }
     let ellipsis = if ascii { "..." } else { "…" };
-    let ellipsis_width = ellipsis.width();
-    if max_width <= ellipsis_width {
-        return ellipsis.to_string();
+    // If even the full ellipsis does not fit, return as much of it as does
+    // (e.g. ASCII width 1 -> ".", width 2 -> "..").
+    if max_width < ellipsis.width() {
+        return prefix_by_width(ellipsis, max_width);
     }
+    let budget = max_width - ellipsis.width();
+    let mut out = prefix_by_width(s, budget);
+    out.push_str(ellipsis);
+    out
+}
+
+/// The longest prefix of `s` whose display width is at most `max_width`.
+/// Iterates by `char`, so CJK, full-width, and emoji are never split.
+fn prefix_by_width(s: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut width = 0;
     for ch in s.chars() {
         let w = ch.width().unwrap_or(0);
-        if width + w > max_width - ellipsis_width {
+        if width + w > max_width {
             break;
         }
         out.push(ch);
         width += w;
     }
-    out.push_str(ellipsis);
     out
 }
 
@@ -491,12 +509,53 @@ mod tests {
 
     #[test]
     fn trunc_handles_zero_and_tiny_widths_without_panic() {
-        assert_eq!(trunc("abc", 0, false), "");
-        assert_eq!(trunc("abc", 0, true), "");
-        assert_eq!(trunc("abc", 1, false), "…");
-        assert_eq!(trunc("abcd", 3, true), "...");
+        assert_eq!(trunc("abcdef", 0, false), "");
+        assert_eq!(trunc("abcdef", 0, true), "");
+        assert_eq!(trunc("abcdef", 1, false), "…");
         assert_eq!(trunc("あいう", 1, false), "…");
         // A string that fits is never truncated.
         assert_eq!(trunc("abc", 3, true), "abc");
+    }
+
+    #[test]
+    fn trunc_ascii_tiny_widths_never_exceed_budget() {
+        // ASCII ellipsis is 3 columns; smaller budgets get a shortened
+        // ellipsis instead of overflowing the width.
+        assert_eq!(trunc("abcdef", 1, true), ".");
+        assert_eq!(trunc("abcdef", 2, true), "..");
+        assert_eq!(trunc("abcdef", 3, true), "...");
+        assert_eq!(trunc("abcdef", 4, true), "a...");
+    }
+
+    #[test]
+    fn trunc_result_never_exceeds_max_width() {
+        let samples = ["abcdef", "日本語テキスト", "a🎉b🎉c", "  spaced  "];
+        for s in samples {
+            for max_width in 0..=12 {
+                for ascii in [false, true] {
+                    let out = trunc(s, max_width, ascii);
+                    assert!(
+                        out.width() <= max_width,
+                        "width {} > budget {} for {:?} ascii={}",
+                        out.width(),
+                        max_width,
+                        s,
+                        ascii
+                    );
+                    if ascii {
+                        // ASCII mode must not add a Unicode ellipsis; the
+                        // source characters themselves may be non-ASCII.
+                        assert!(!out.contains('…'), "no Unicode ellipsis in ASCII mode: {:?}", out);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trunc_returns_string_as_is_when_it_fits() {
+        assert_eq!(trunc("…x…", 3, true), "…x…");
+        assert_eq!(trunc("…x…", 10, true), "…x…");
+        assert_eq!(trunc("日本語", 6, false), "日本語");
     }
 }

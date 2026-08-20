@@ -128,6 +128,13 @@ impl AppState {
         }
     }
 
+    /// Whether pausing is possible: a snapshot must exist to freeze.
+    /// Pause requests before the first snapshot are ignored, so the footer
+    /// only advertises `p` once this is true.
+    pub fn can_pause(&self) -> bool {
+        self.latest.is_some() || self.paused
+    }
+
     /// Seconds since the latest backend snapshot arrived (None if never).
     pub fn last_update_age(&self, now: Instant) -> Option<u64> {
         self.last_update.map(|t| now.duration_since(t).as_secs())
@@ -299,14 +306,21 @@ impl AppState {
     }
 
     /// Apply a backend error summary.
+    ///
+    /// Each new error replaces the previous one: `authentication_failed` is
+    /// re-evaluated for the incoming error, so a transport error clears a
+    /// stale auth-failure state (and vice versa).
     pub fn apply_error(&mut self, err: BackendErrorSummary) {
-        // `BackendError::Authentication` renders as "authentication failed: ..."
-        // (see `crate::error`); the flag drives the env-var hint view.
-        if err.message.starts_with("authentication failed") {
-            self.authentication_failed = true;
-        }
+        self.authentication_failed = is_authentication_error(&err.message);
         self.connection_message = Some(err.message);
     }
+}
+
+/// True when an error message is the authentication failure produced by
+/// `BackendError::Authentication` (see `crate::error`). Kept in one place
+/// so the marker string is not duplicated.
+fn is_authentication_error(message: &str) -> bool {
+    message.starts_with("authentication failed")
 }
 
 #[cfg(test)]
@@ -396,6 +410,18 @@ mod tests {
         assert!(s.connection_message.is_some());
         s.apply_snapshot(snapshot(ConnectionState::Connected, Some(10.0)));
         assert!(s.connection_message.is_none(), "stale transport error must be cleared");
+    }
+
+    #[test]
+    fn transport_error_replaces_stale_authentication_state() {
+        let mut s = AppState::new(&config());
+        s.apply_error(BackendErrorSummary::new(
+            "authentication failed: the server rejected the API key (HTTP 401)",
+        ));
+        assert!(s.authentication_failed);
+        s.apply_error(BackendErrorSummary::new("cannot connect: connection refused"));
+        assert!(!s.authentication_failed, "a new transport error must clear the stale auth state");
+        assert_eq!(s.connection_message.as_deref(), Some("cannot connect: connection refused"));
     }
 
     #[test]

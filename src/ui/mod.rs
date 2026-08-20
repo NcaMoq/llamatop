@@ -26,9 +26,10 @@ pub use terminal::{PanicRestorer, TerminalGuard, TerminalModes};
 
 /// Run the interactive TUI until the user quits.
 ///
-/// Returns the process exit code (0 for a clean quit). Terminal
-/// initialization failure is the only `Err` case: the terminal state cannot
-/// be trusted in that situation.
+/// Returns the process exit code (0 for a clean quit). `Err` is returned on
+/// terminal initialization failure, a rendering failure, an event-loop
+/// failure (e.g. a failed command send), or a collector task failure during
+/// shutdown; the terminal is restored on every exit path.
 pub async fn run_tui(config: &Config) -> anyhow::Result<i32> {
     // Only the bare `llamatop` invocation reaches here; doctor/snapshot run
     // without raw mode or the alternate screen.
@@ -326,9 +327,29 @@ mod tests {
         let content = render_content(&state, false, 80, 20);
         assert!(content.contains("q Quit"));
         assert!(content.contains("r Reconnect"));
-        assert!(content.contains("p Pause"));
+        // Pause is not possible before the first snapshot, so it is not
+        // advertised in the waiting view.
+        assert!(!content.contains("p Pause"));
         assert!(!content.contains("? Help"), "help modal is not implemented yet");
         assert!(!content.contains("l Logs"), "event log panel is not implemented yet");
+    }
+
+    #[test]
+    fn footer_shows_pause_after_first_snapshot() {
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("p Pause"));
+        assert!(!content.contains("p Resume"));
+    }
+
+    #[test]
+    fn footer_shows_resume_label_while_paused() {
+        let mut state = connected_ready(|_| {});
+        state.handle_input(crate::app::event::InputAction::TogglePause);
+        assert!(state.paused);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("p Resume"));
+        assert!(!content.contains("p Pause"));
     }
 
     #[test]

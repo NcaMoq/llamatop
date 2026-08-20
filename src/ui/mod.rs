@@ -618,6 +618,201 @@ mod tests {
         let _ = render_content(&state, false, 1, 1);
     }
 
+    /// One history sample for tests: (prompt, generation, active, queued).
+    type Sample = (Option<f64>, Option<f64>, Option<u64>, Option<u64>);
+
+    /// State with the given (prompt, generation, active, queued) samples
+    /// already recorded in the history.
+    fn state_with_history(samples: &[Sample]) -> AppState {
+        let mut state = connected_slots(|_| {});
+        // Drop the sample recorded by the connected-ready setup so the
+        // window contains exactly the samples under test.
+        state.history.clear();
+        for (p, g, a, q) in samples {
+            let snap = BackendSnapshot {
+                connection: ConnectionState::Connected,
+                prompt_tokens_per_second: *p,
+                generation_tokens_per_second: *g,
+                active_requests: *a,
+                queued_requests: *q,
+                ..Default::default()
+            };
+            state.history.record(&snap, std::time::Instant::now());
+        }
+        state
+    }
+
+    const HISTORY_SAMPLES: [Sample; 8] = [
+        (Some(10.0), Some(1.0), Some(1), Some(0)),
+        (Some(20.0), Some(2.0), Some(2), Some(1)),
+        (Some(30.0), None, Some(1), None),
+        (Some(40.0), Some(4.0), Some(4), Some(2)),
+        (Some(50.0), Some(5.0), Some(3), Some(0)),
+        (Some(60.0), Some(6.0), Some(2), Some(1)),
+        (Some(70.0), Some(7.0), Some(1), Some(0)),
+        (Some(80.0), Some(8.0), Some(1), Some(1)),
+    ];
+
+    #[test]
+    fn history_panel_renders_with_samples() {
+        let state = state_with_history(&HISTORY_SAMPLES);
+        let content = render_content(&state, false, 100, 30);
+        let lines = split_rows(&content, 100);
+        assert!(
+            lines.iter().any(|l| l.contains("History")),
+            "panel title must render in the wide layout"
+        );
+        // The legend row is unique to the history panel; it must show the
+        // latest values (80.0 / 8.0 / 1 / 1) with their P/G/A/Q labels.
+        let legend = lines.iter().find(|l| l.contains("P 80.0")).expect("history legend row");
+        assert!(legend.contains("G 8.0"));
+        assert!(legend.contains("A 1"));
+        assert!(legend.contains("Q 1"));
+        // Series labels are text, not colors only.
+        assert!(lines.iter().any(|l| l.contains("Prompt")));
+        assert!(lines.iter().any(|l| l.contains("Gen     ")));
+        assert!(lines.iter().any(|l| l.contains("Active  ")));
+        assert!(lines.iter().any(|l| l.contains("Queued  ")));
+    }
+
+    #[test]
+    fn history_panel_all_missing_values_show_placeholder_not_zero() {
+        let state = state_with_history(&[(None, None, None, None), (None, None, None, None)]);
+        let content = render_content(&state, false, 100, 30);
+        // Legend placeholders, never "0.0".
+        assert!(content.contains("P —"));
+        assert!(content.contains("G —"));
+        // No sparkline glyph may appear for an all-missing window.
+        assert!(!content.contains('▁'));
+        assert!(!content.contains('█'));
+    }
+
+    #[test]
+    fn history_panel_mixed_missing_values_render_gaps() {
+        let state = state_with_history(&[
+            (Some(10.0), Some(1.0), Some(1), None),
+            (None, None, None, None),
+            (Some(20.0), Some(2.0), Some(2), Some(1)),
+        ]);
+        let content = render_content(&state, false, 100, 30);
+        // Present values draw glyphs; the middle sample is a gap (blank).
+        assert!(content.contains('▁') || content.contains('█'), "glyphs for present samples");
+        let lines = split_rows(&content, 100);
+        // The history Active row is the only "Active" row carrying sparkline
+        // glyphs (the inference panel row has digits, not glyphs).
+        let active_row = lines
+            .iter()
+            .find(|l| l.contains("Active") && l.contains('▄'))
+            .expect("history Active row");
+        // glyph (1.0), blank gap (missing sample), glyph (2.0)
+        let chars: Vec<char> = active_row.chars().collect();
+        let i = chars.iter().position(|&c| c == '▄').expect("first glyph");
+        assert_eq!(
+            &chars[i..i + 3],
+            &['▄', ' ', '█'],
+            "the missing middle sample must leave a blank column: {active_row}"
+        );
+    }
+
+    #[test]
+    fn history_panel_single_sample_renders() {
+        let state = state_with_history(&[(Some(5.0), Some(1.5), Some(1), Some(0))]);
+        let content = render_content(&state, false, 100, 30);
+        let lines = split_rows(&content, 100);
+        assert!(lines.iter().any(|l| l.contains("Prompt")));
+        assert!(content.contains("P 5.0"));
+        assert!(content.contains("G 1.5"));
+        assert!(!content.contains("No recent data"), "a sample exists");
+    }
+
+    #[test]
+    fn history_panel_empty_shows_no_recent_data() {
+        // A fresh state with no recorded samples at all.
+        let mut state = connected_slots(|_| {});
+        state.history.clear();
+        let content = render_content(&state, false, 100, 30);
+        assert!(content.contains("No recent data"));
+    }
+
+    #[test]
+    fn history_panel_capacity_sized_samples_do_not_panic() {
+        // Capacity of the default config (120s @ 500ms) is 240; record all
+        // of them — the panel must window down to the plot width.
+        let samples: Vec<Sample> = (0..240)
+            .map(|i| (Some(i as f64), Some(i as f64 / 10.0), Some(i % 4), Some(i % 2)))
+            .collect();
+        let state = state_with_history(&samples);
+        let _ = render_content(&state, false, 100, 30);
+        let _ = render_content(&state, false, 80, 20);
+    }
+
+    #[test]
+    fn history_panel_does_not_panic_at_small_sizes() {
+        let state = state_with_history(&HISTORY_SAMPLES);
+        // 80x20: slots keep their full table (lowest priority is history),
+        // so the history panel is hidden — without a panic.
+        let content = render_content(&state, false, 80, 20);
+        assert!(!content.contains("History"), "history is hidden at 80x20");
+        // 1x1 and 62x16 fall back to the too-small view without panicking.
+        let _ = render_content(&state, false, 1, 1);
+        let _ = render_content(&state, false, 62, 16);
+    }
+
+    #[test]
+    fn history_panel_ascii_mode_has_no_unicode_glyphs() {
+        let state = state_with_history(&HISTORY_SAMPLES);
+        let ascii = render_content(&state, true, 100, 30);
+        assert!(!ascii.contains('▁'));
+        assert!(!ascii.contains('█'));
+        assert!(!ascii.contains('▀'));
+        assert!(!ascii.contains('▄'));
+        assert!(ascii.contains("Prompt"));
+    }
+
+    #[test]
+    fn history_panel_large_rates_do_not_break_layout() {
+        let state = state_with_history(&[
+            (Some(1.0), Some(1.0), Some(1), Some(1)),
+            (Some(1e12), Some(1e12), Some(1_000_000), Some(1)),
+        ]);
+        let content = render_content(&state, false, 100, 30);
+        let lines = split_rows(&content, 100);
+        assert!(
+            lines.iter().any(|l| l.contains("Prompt")),
+            "the panel must survive extreme values"
+        );
+    }
+
+    #[test]
+    fn history_zero_rate_is_distinguishable_from_missing() {
+        // A true 0 sample draws the lowest ramp glyph; a missing sample
+        // leaves a blank column (sparkline rows, wide layout).
+        let state = state_with_history(&[
+            (Some(1.0), Some(1.0), Some(0), None),
+            (Some(2.0), Some(2.0), None, Some(1)),
+        ]);
+        let content = render_content(&state, false, 100, 30);
+        let lines = split_rows(&content, 100);
+        // History sparkline rows are the only "Active"/"Queued" rows with
+        // ramp glyphs; the inference row shows digits.
+        let active_row = lines
+            .iter()
+            .find(|l| l.contains("Active") && l.contains('▁'))
+            .expect("history Active row");
+        let chars: Vec<char> = active_row.chars().collect();
+        let i = chars.iter().position(|&c| c == '▁').expect("zero glyph");
+        assert_eq!(
+            &chars[i..i + 2],
+            &['▁', ' '],
+            "zero count = lowest glyph, missing = blank: {active_row}"
+        );
+        let queued_row = lines
+            .iter()
+            .find(|l| l.contains("Queued") && l.contains('█'))
+            .expect("history Queued row");
+        assert!(queued_row.contains('█'), "a present count draws the highest glyph: {queued_row}");
+    }
+
     #[test]
     fn slot_table_at_80x20_shows_header_and_row_with_metrics_warning() {
         // /slots available, /metrics unavailable: the warning lines render

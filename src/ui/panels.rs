@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Paragraph, Row};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::app::history::HistorySample;
 use crate::app::state::AppState;
 use crate::display::Symbols;
 use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState, SlotSnapshot};
@@ -84,19 +85,42 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                     match s.connection {
                         ConnectionState::Connected => {
                             // Middle area: inference (fixed), the slot table
-                            // (variable, takes the spare space), and the
-                            // status/warning area (only as many lines as it
-                            // has content).
+                            // (variable), the history panel (as much as the
+                            // remaining space allows; hidden when it would
+                            // squeeze the slot table), and the status/warning
+                            // area (only as many lines as it has content).
                             let status_count = status_lines(state, symbols).len();
+                            let free = chunks[1]
+                                .height
+                                .saturating_sub(6)
+                                .saturating_sub(status_count as u16);
+                            // The slot table keeps its full 5 data rows at
+                            // 80x20 (history has the lowest priority there
+                            // and is hidden). History tiers as space allows
+                            // (block height = inner content + 2 borders):
+                            // 9 = full (legend + 2-row bars + sparklines),
+                            // 6 = one row per series, 4 = two series rows,
+                            // 3 = one summary row, 0 = hidden.
+                            let history_h = match free {
+                                f if f >= 15 => 9,
+                                f if f >= 12 => 6,
+                                f if f >= 10 => 4,
+                                f if f >= 9 => 3,
+                                _ => 0,
+                            };
                             let mid = Layout::vertical([
                                 Constraint::Length(6),
                                 Constraint::Min(1),
+                                Constraint::Length(history_h),
                                 Constraint::Length(status_count as u16),
                             ])
                             .split(chunks[1]);
                             render_inference(f, mid[0], s, symbols);
                             render_slots(f, mid[1], state, symbols);
-                            render_status(f, mid[2], state, symbols);
+                            if history_h > 0 {
+                                render_history(f, mid[2], state, symbols);
+                            }
+                            render_status(f, mid[3], state, symbols);
                         }
                         _ => render_connection_view(f, chunks[1], state, s, symbols),
                     }
@@ -234,6 +258,176 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols)
     }
     let text = Paragraph::new(lines.join("\n"));
     f.render_widget(text, area);
+}
+
+/// History panel: sparkline rows for prompt/generation throughput and
+/// active/queued requests.
+///
+/// Missing samples are gaps (blank), never zeros: a `0.0` sample renders
+/// the lowest glyph of the ramp, a missing sample renders nothing. Series
+/// are distinguished by their text labels (and color), never by color alone.
+fn render_history(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
+    let block = Block::bordered().title(" History ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let samples = state.history.samples();
+    if samples.is_empty() {
+        let text = Paragraph::new("No recent data");
+        f.render_widget(text, inner);
+        return;
+    }
+
+    // Label column: "Prompt" fits in 7 + 1 gap.
+    let label_w = 8usize.min(inner.width as usize);
+    let plot_w = (inner.width as usize).saturating_sub(label_w);
+    if plot_w == 0 {
+        return;
+    }
+
+    // Take the newest samples that fit one column each.
+    let count = plot_w.min(samples.len());
+    let start = samples.len() - count;
+    let window: Vec<&HistorySample> = samples.iter().skip(start).collect();
+
+    let prompt: Vec<Option<f64>> = window.iter().map(|s| s.prompt_tokens_per_second).collect();
+    let generation: Vec<Option<f64>> =
+        window.iter().map(|s| s.generation_tokens_per_second).collect();
+    let active: Vec<Option<f64>> =
+        window.iter().map(|s| s.active_requests.map(|v| v as f64)).collect();
+    let queued: Vec<Option<f64>> =
+        window.iter().map(|s| s.queued_requests.map(|v| v as f64)).collect();
+
+    let ascii = symbols.is_ascii();
+    let indent = " ".repeat(label_w);
+    let mut lines: Vec<Line> = Vec::new();
+
+    match inner.height {
+        // Full (exactly 7 rows): legend + two 2-row bar series + two
+        // 1-row sparklines. Labels sit on the first row of each series.
+        h if h >= 7 => {
+            let legend = format!(
+                "P {}   G {}   A {}   Q {}",
+                latest_rate(&prompt, symbols),
+                latest_rate(&generation, symbols),
+                latest_int(&active, symbols),
+                latest_int(&queued, symbols)
+            );
+            lines.push(Line::from(legend));
+            let (p_top, p_bot) = bar_rows(&prompt, ascii);
+            lines.push(Line::from(format!("Prompt  {}", p_top)));
+            lines.push(Line::from(format!("{indent}{}", p_bot)));
+            let (g_top, g_bot) = bar_rows(&generation, ascii);
+            lines.push(Line::from(format!("Gen     {}", g_top)));
+            lines.push(Line::from(format!("{indent}{}", g_bot)));
+            lines.push(Line::from(format!("Active  {}", sparkline(&active, ascii))));
+            lines.push(Line::from(format!("Queued  {}", sparkline(&queued, ascii))));
+        }
+        // One row per series (no legend; labels carry the identity).
+        4 => {
+            lines.push(Line::from(format!("Prompt  {}", sparkline(&prompt, ascii))));
+            lines.push(Line::from(format!("Gen     {}", sparkline(&generation, ascii))));
+            lines.push(Line::from(format!("Active  {}", sparkline(&active, ascii))));
+            lines.push(Line::from(format!("Queued  {}", sparkline(&queued, ascii))));
+        }
+        2 => {
+            lines.push(Line::from(format!("Prompt  {}", sparkline(&prompt, ascii))));
+            lines.push(Line::from(format!("Gen     {}", sparkline(&generation, ascii))));
+        }
+        // Single summary row: latest values only.
+        _ => {
+            let text = format!(
+                "P {}  G {}  A {}  Q {}",
+                latest_rate(&prompt, symbols),
+                latest_rate(&generation, symbols),
+                latest_int(&active, symbols),
+                latest_int(&queued, symbols)
+            );
+            lines.push(Line::from(text));
+        }
+    }
+
+    let text = Paragraph::new(lines);
+    f.render_widget(text, inner);
+}
+
+/// One sparkline row: one glyph per sample. Missing -> blank (gap);
+/// present (including 0) -> ramp glyph scaled to the window maximum.
+fn sparkline(values: &[Option<f64>], ascii: bool) -> String {
+    let ramp: Vec<char> = if ascii {
+        "._:-+*#".chars().collect()
+    } else {
+        "▁▂▃▄▅▆▇█".chars().collect()
+    };
+    let max = values.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
+    values
+        .iter()
+        .map(|v| match v {
+            None => ' ',
+            Some(v) => {
+                let idx = if max <= 0.0 {
+                    0
+                } else {
+                    let ratio = (*v / max).clamp(0.0, 1.0);
+                    (ratio * (ramp.len() - 1) as f64) as usize
+                };
+                ramp[idx]
+            }
+        })
+        .collect()
+}
+
+/// Two stacked bar rows for one rate series (top + bottom). Missing ->
+/// blanks in both rows; 0 -> lowest glyph in the bottom row only.
+fn bar_rows(values: &[Option<f64>], ascii: bool) -> (String, String) {
+    let max = values.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
+    let mut top = String::with_capacity(values.len());
+    let mut bottom = String::with_capacity(values.len());
+    for v in values {
+        match v {
+            None => {
+                top.push(' ');
+                bottom.push(' ');
+            }
+            Some(v) => {
+                let ratio = if max <= 0.0 { 0.0 } else { (*v / max).clamp(0.0, 1.0) };
+                let glyph = if ascii {
+                    if ratio >= 0.5 {
+                        '#'
+                    } else {
+                        '*'
+                    }
+                } else if ratio >= 0.5 {
+                    '█'
+                } else {
+                    '▄'
+                };
+                top.push(if ratio >= 0.5 { glyph } else { ' ' });
+                bottom.push(if ascii { '.' } else { '▀' });
+            }
+        }
+    }
+    (top, bottom)
+}
+
+/// Latest value of a rate series, or the placeholder (never 0).
+fn latest_rate(values: &[Option<f64>], symbols: &Symbols) -> String {
+    match values.iter().rev().find_map(|v| *v) {
+        Some(v) => format!("{v:.1}"),
+        None => placeholder(symbols).to_string(),
+    }
+}
+
+/// Latest value of a count series (stored as f64 for the sparkline),
+/// rendered as an integer; placeholder when missing (never 0).
+fn latest_int(values: &[Option<f64>], symbols: &Symbols) -> String {
+    match values.iter().rev().find_map(|v| *v) {
+        Some(v) => (v as u64).to_string(),
+        None => placeholder(symbols).to_string(),
+    }
 }
 
 /// Slot monitoring table: stable ID order, one selected row, vertical

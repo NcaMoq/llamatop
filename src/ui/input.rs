@@ -41,6 +41,11 @@ pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputActi
         KeyCode::PageDown => Some(InputAction::LogPageDown),
         KeyCode::Home => Some(InputAction::LogHome),
         KeyCode::End => Some(InputAction::LogEnd),
+        // Help modal: `?` opens/closes it, Esc closes it (or the slot
+        // detail / event log when the modal is not open). While the modal is
+        // open the state blocks all other actions.
+        KeyCode::Char('?') => Some(InputAction::ToggleHelp),
+        KeyCode::Esc => Some(InputAction::CloseModal),
         _ => None,
     }
 }
@@ -130,8 +135,9 @@ mod tests {
     }
 
     #[test]
-    fn help_key_is_not_bound_until_the_modal_exists() {
-        assert_eq!(key(KeyCode::Char('?')), None);
+    fn help_and_modal_keys_are_bound() {
+        assert_eq!(key(KeyCode::Char('?')), Some(InputAction::ToggleHelp));
+        assert_eq!(key(KeyCode::Esc), Some(InputAction::CloseModal));
     }
 
     #[test]
@@ -153,10 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_keys_are_ignored() {
-        // No help modal, slot detail, or panel focus is implemented yet, so
-        // none of these may map to an action.
-        assert_eq!(key(KeyCode::Esc), None);
+    fn unbound_keys_are_ignored() {
+        // Tab/Shift+Tab (panel focus) and Enter (slot detail) have no visible
+        // target in the current layout, so they must not map to an action
+        // (binding them would change state with no visible effect).
         assert_eq!(key(KeyCode::Tab), None);
         assert_eq!(key_to_action(KeyCode::Tab, KeyModifiers::SHIFT), None);
         assert_eq!(key(KeyCode::Left), None);

@@ -169,6 +169,13 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
             }
         }
     }
+
+    // The help modal overlays the active view. It is drawn last so it covers
+    // whatever is underneath; the state blocks background input while it is
+    // open, so the view beneath does not change.
+    if state.show_help {
+        render_help(f, state, symbols);
+    }
 }
 
 /// "Terminal is too small" fallback.
@@ -178,6 +185,55 @@ fn render_too_small(f: &mut Frame, area: Rect) {
         MIN_WIDTH, MIN_HEIGHT, area.width, area.height
     ));
     f.render_widget(text, area);
+}
+
+/// The help modal: a centered dialog over the active view listing the
+/// implemented controls only. Panel focus and slot detail are not
+/// implemented, so they are deliberately not advertised here. Background
+/// input is blocked by the state while the modal is open.
+fn render_help(f: &mut Frame, _state: &AppState, _symbols: &Symbols) {
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // (key, action) pairs, in display order. Only keys with a visible effect
+    // are listed.
+    let rows: [(&str, &str); 11] = [
+        ("q, Ctrl+C", "Quit"),
+        ("r", "Manual reconnect"),
+        ("p", "Pause / resume"),
+        ("l", "Toggle event log"),
+        ("c", "Clear event log / history"),
+        ("PageUp / PageDown", "Scroll event log"),
+        ("Home / End", "Jump in event log"),
+        ("Up / k", "Slot up"),
+        ("Down / j", "Slot down"),
+        ("?", "Toggle this help"),
+        ("Esc", "Close help / event log"),
+    ];
+    const KEY_W: usize = 18;
+    let mut lines: Vec<Line> = Vec::new();
+    for (key, desc) in rows {
+        lines.push(Line::from(format!("{key:<KEY_W$}  {desc}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Press ? or Esc to close"));
+
+    // Centered box: sized to fit every row (content + 2 borders), capped by
+    // the terminal; width capped so it stays a tidy dialog on wide terminals.
+    let box_h = ((lines.len() + 2) as u16).min(area.height.saturating_sub(2));
+    let box_w = 48u16.min(area.width.saturating_sub(2));
+    let y = area.y + area.height.saturating_sub(box_h) / 2;
+    let x = area.x + area.width.saturating_sub(box_w) / 2;
+    let dialog = Rect::new(x, y, box_w, box_h);
+
+    let block = Block::bordered().title(" Help ").title_alignment(Alignment::Center);
+    let inner = block.inner(dialog);
+    f.render_widget(block, dialog);
+    if inner.width > 0 && inner.height > 0 {
+        f.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 /// Header block: connection, backend, model, server state, phase, counts.
@@ -982,6 +1038,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols)
         return;
     }
     let mut footer = " q Quit   r Reconnect".to_string();
+    // The help modal (`?`) is available in every view.
+    footer.push_str("   ? Help");
     if state.can_pause() {
         let action = if state.paused { "p Resume" } else { "p Pause" };
         footer.push_str("   ");

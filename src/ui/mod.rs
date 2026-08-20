@@ -323,15 +323,71 @@ mod tests {
     }
 
     #[test]
+    fn help_modal_is_hidden_by_default() {
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 100, 30);
+        // The footer advertises "? Help", but the modal itself (close hint,
+        // control rows) must not be present.
+        assert!(!content.contains("Press ? or Esc to close"), "no modal by default");
+        assert!(!content.contains("Manual reconnect"), "no help rows by default");
+        assert!(!content.contains("Toggle event log"), "no help rows by default");
+    }
+
+    #[test]
+    fn help_modal_shows_only_implemented_controls() {
+        let mut state = connected_ready(|_| {});
+        state.handle_input(crate::app::event::InputAction::ToggleHelp);
+        assert!(state.show_help);
+        let content = render_content(&state, false, 100, 30);
+        assert!(content.contains("Help"), "modal title");
+        // Every advertised control is implemented.
+        assert!(content.contains("Quit"));
+        assert!(content.contains("Manual reconnect"));
+        assert!(content.contains("Pause / resume"));
+        assert!(content.contains("Toggle event log"));
+        assert!(content.contains("Scroll event log"));
+        assert!(content.contains("Slot up"));
+        assert!(content.contains("Close help / event log"));
+        // Unimplemented features must NOT be advertised.
+        assert!(!content.contains("Focus"), "panel focus is not implemented");
+        assert!(!content.contains("Tab"), "Tab/Shift+Tab are unbound");
+        assert!(!content.contains("Slot detail"), "slot detail is not implemented");
+    }
+
+    #[test]
+    fn help_modal_ascii_mode_has_no_status_symbols() {
+        let mut state = connected_ready(|_| {});
+        state.handle_input(crate::app::event::InputAction::ToggleHelp);
+        let content = render_content(&state, true, 100, 30);
+        // The modal rows are plain ASCII; no Unicode status symbols appear.
+        assert!(content.contains("Help"));
+        assert!(!content.contains("●"));
+        assert!(!content.contains("○"));
+        assert!(!content.contains("▲"));
+        assert!(!content.contains("✘"));
+        assert!(!content.contains("—"));
+    }
+
+    #[test]
+    fn help_modal_does_not_panic_at_small_sizes() {
+        let mut state = connected_ready(|_| {});
+        state.handle_input(crate::app::event::InputAction::ToggleHelp);
+        let _ = render_content(&state, false, 80, 20);
+        let _ = render_content(&state, false, 62, 16);
+        let _ = render_content(&state, false, 1, 1);
+    }
+
+    #[test]
     fn footer_only_advertises_implemented_controls() {
         let state = AppState::new(&Config::default());
         let content = render_content(&state, false, 80, 20);
         assert!(content.contains("q Quit"));
         assert!(content.contains("r Reconnect"));
+        // The help modal is available in every view.
+        assert!(content.contains("? Help"));
         // Pause is not possible before the first snapshot, so it is not
         // advertised in the waiting view.
         assert!(!content.contains("p Pause"));
-        assert!(!content.contains("? Help"), "help modal is not implemented yet");
         // The event log only exists in the connected view, so it is not
         // advertised in the waiting view.
         assert!(!content.contains("l Events"));

@@ -277,13 +277,10 @@ impl AppState {
 
     /// Apply a keyboard action.
     pub fn handle_input(&mut self, action: InputAction) {
-        // While a modal is open, only modal-closing and quit actions apply.
-        if self.show_help
-            && !matches!(
-                action,
-                InputAction::Quit | InputAction::ToggleHelp | InputAction::CloseModal
-            )
-        {
+        // While the help modal is open, background input is blocked: only the
+        // actions that close or toggle the modal apply. In particular `q`
+        // does NOT quit while the modal is open (close it first with `?`/Esc).
+        if self.show_help && !matches!(action, InputAction::ToggleHelp | InputAction::CloseModal) {
             return;
         }
 
@@ -1307,7 +1304,26 @@ mod tests {
         assert!(s.show_help);
         s.handle_input(InputAction::TogglePause); // ignored while help is open
         assert!(!s.paused);
+        s.handle_input(InputAction::SlotDown); // ignored while help is open
+        s.handle_input(InputAction::Quit); // q must NOT quit while help is open
+        assert!(!s.should_quit, "q is blocked while the help modal is open");
         s.handle_input(InputAction::CloseModal);
+        assert!(!s.show_help);
+        // After closing the modal, background actions apply again.
+        s.handle_input(InputAction::Quit);
+        assert!(s.should_quit, "q quits once the modal is closed");
+    }
+
+    #[test]
+    fn help_toggle_is_idempotent_with_esc() {
+        let mut s = AppState::new(&config());
+        s.handle_input(InputAction::ToggleHelp); // `?` opens
+        assert!(s.show_help);
+        s.handle_input(InputAction::CloseModal); // Esc closes
+        assert!(!s.show_help);
+        s.handle_input(InputAction::ToggleHelp); // `?` opens again
+        assert!(s.show_help);
+        s.handle_input(InputAction::ToggleHelp); // `?` closes
         assert!(!s.show_help);
     }
 }

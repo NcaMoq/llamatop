@@ -18,7 +18,7 @@ use crate::app::event::{AppEvent, InputAction};
 /// Map a raw key event to an application action, if any.
 ///
 /// Only keys with an implemented, visible effect are bound. Keys whose
-/// features are not implemented yet (help modal, slot selection, event log,
+/// features are not implemented yet (help modal, slot detail, event log,
 /// history clear, panel focus) map to `None` so they cannot change state or
 /// make the TUI look frozen. They are re-enabled when the feature ships.
 pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputAction> {
@@ -27,6 +27,11 @@ pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputActi
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(InputAction::Quit),
         KeyCode::Char('r') => Some(InputAction::Reconnect),
         KeyCode::Char('p') => Some(InputAction::TogglePause),
+        // Slot table navigation: arrows and vim-style j/k. Whether they
+        // actually move the selection is decided by the state (the /slots
+        // endpoint must be available and a slot must exist).
+        KeyCode::Up | KeyCode::Char('k') => Some(InputAction::SlotUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(InputAction::SlotDown),
         _ => None,
     }
 }
@@ -121,16 +126,26 @@ mod tests {
     }
 
     #[test]
+    fn slot_navigation_keys_are_bound() {
+        assert_eq!(key(KeyCode::Up), Some(InputAction::SlotUp));
+        assert_eq!(key(KeyCode::Char('k')), Some(InputAction::SlotUp));
+        assert_eq!(key(KeyCode::Down), Some(InputAction::SlotDown));
+        assert_eq!(key(KeyCode::Char('j')), Some(InputAction::SlotDown));
+    }
+
+    #[test]
     fn unimplemented_keys_are_ignored() {
-        // No modal, slot table, event log, history clear, or panel focus is
-        // implemented yet, so none of these may map to an action.
+        // No help modal, slot detail, event log, history clear, or panel
+        // focus is implemented yet, so none of these may map to an action.
         assert_eq!(key(KeyCode::Esc), None);
         assert_eq!(key(KeyCode::Tab), None);
         assert_eq!(key_to_action(KeyCode::Tab, KeyModifiers::SHIFT), None);
-        assert_eq!(key(KeyCode::Up), None);
-        assert_eq!(key(KeyCode::Char('k')), None);
-        assert_eq!(key(KeyCode::Down), None);
-        assert_eq!(key(KeyCode::Char('j')), None);
+        assert_eq!(key(KeyCode::Left), None);
+        assert_eq!(key(KeyCode::Right), None);
+        assert_eq!(key(KeyCode::PageUp), None);
+        assert_eq!(key(KeyCode::PageDown), None);
+        assert_eq!(key(KeyCode::Home), None);
+        assert_eq!(key(KeyCode::End), None);
         assert_eq!(key(KeyCode::Enter), None);
         assert_eq!(key(KeyCode::Char('l')), None);
         assert_eq!(key(KeyCode::Char('c')), None);

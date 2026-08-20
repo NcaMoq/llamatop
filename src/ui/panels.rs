@@ -9,13 +9,15 @@
 use std::time::Instant;
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Paragraph, Row};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::state::AppState;
 use crate::display::Symbols;
-use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState};
+use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState, SlotSnapshot};
 
 /// Minimum size at which the full panel layout is rendered.
 pub const MIN_WIDTH: u16 = 80;
@@ -44,7 +46,7 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
             ])
             .split(area);
             render_waiting(f, chunks[0], &state.endpoint, symbols);
-            render_footer(f, chunks[2], state);
+            render_footer(f, chunks[2], state, symbols);
         }
         Some(s) => {
             match (s.connection, s.server) {
@@ -68,7 +70,7 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                         }
                         _ => {}
                     }
-                    render_footer(f, chunks[2], state);
+                    render_footer(f, chunks[2], state, symbols);
                 }
                 // Header: border + 3 content lines. Inference: border + 4 lines.
                 _ => {
@@ -81,16 +83,24 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                     render_header(f, chunks[0], state, s, symbols);
                     match s.connection {
                         ConnectionState::Connected => {
-                            // Inference takes the top of the middle area;
-                            // the status/warning area gets the rest.
-                            let mid = Layout::vertical([Constraint::Length(6), Constraint::Min(0)])
-                                .split(chunks[1]);
+                            // Middle area: inference (fixed), the slot table
+                            // (variable, takes the spare space), and the
+                            // status/warning area (only as many lines as it
+                            // has content).
+                            let status_count = status_lines(state, symbols).len();
+                            let mid = Layout::vertical([
+                                Constraint::Length(6),
+                                Constraint::Min(1),
+                                Constraint::Length(status_count as u16),
+                            ])
+                            .split(chunks[1]);
                             render_inference(f, mid[0], s, symbols);
-                            render_status(f, mid[1], state, symbols);
+                            render_slots(f, mid[1], state, symbols);
+                            render_status(f, mid[2], state, symbols);
                         }
                         _ => render_connection_view(f, chunks[1], state, s, symbols),
                     }
-                    render_footer(f, chunks[2], state);
+                    render_footer(f, chunks[2], state, symbols);
                 }
             }
         }
@@ -197,36 +207,151 @@ fn render_inference(f: &mut Frame, area: Rect, snap: &BackendSnapshot, symbols: 
     f.render_widget(text, inner);
 }
 
-/// Status/warning area: capability warnings and the last error message.
-fn render_status(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
+/// The status/warning lines, shared by the renderer (to size the area) and
+/// by `render_status` (to draw them).
+fn status_lines(state: &AppState, symbols: &Symbols) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     if !state.capabilities.metrics {
         lines.push(format!("{} Metrics unavailable", symbols.warning()));
         lines.push("Throughput values cannot be displayed.".into());
         lines.push("Start llama-server with --metrics.".into());
     }
-    if !state.capabilities.slots {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push(format!("{} Slots unavailable", symbols.warning()));
-        lines.push("Per-slot monitoring will not be available.".into());
-    }
     if let Some(msg) = &state.connection_message {
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push(format!(
-            "{} {}",
-            symbols.error(),
-            trunc(msg, (area.width as usize).saturating_sub(2), symbols.is_ascii())
-        ));
+        lines.push(format!("{} {}", symbols.error(), trunc(msg, 200, symbols.is_ascii())));
     }
-    if lines.is_empty() {
+    lines
+}
+
+/// Status/warning area: capability warnings and the last error message.
+/// "Slots unavailable" is shown by the slot panel itself, not here.
+fn render_status(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
+    let lines = status_lines(state, symbols);
+    if lines.is_empty() || area.height == 0 {
         return;
     }
     let text = Paragraph::new(lines.join("\n"));
     f.render_widget(text, area);
+}
+
+/// Slot monitoring table: stable ID order, one selected row, vertical
+/// scrolling, and responsive columns. Missing values render as the
+/// placeholder, never as 0. Per-slot rates do not exist in the normalized
+/// model, so no rate columns are shown (no guessed values).
+fn render_slots(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
+    let block = Block::bordered().title(" Slots ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if !state.capabilities.slots {
+        // /slots endpoint absent — distinct from "zero slots reported".
+        let text = Paragraph::new(vec![
+            Line::from(format!("{} Slots unavailable", symbols.warning())),
+            Line::from("Per-slot monitoring will not be available."),
+        ]);
+        f.render_widget(text, inner);
+        return;
+    }
+
+    let slots = state.visible_slots();
+    if slots.is_empty() {
+        let text = Paragraph::new("No slots reported");
+        f.render_widget(text, inner);
+        return;
+    }
+
+    let (headers, widths) = slot_columns(inner.width as usize);
+    let sel_marker = if symbols.is_ascii() { "> " } else { "▶ " };
+    let rows: Vec<Row> = slots
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let marker = if i == state.selected_slot { sel_marker } else { "  " };
+            let mut cells: Vec<String> = Vec::with_capacity(headers.len() + 1);
+            cells.push(marker.to_string());
+            cells.extend(slot_cell_values(slot, symbols, headers.len()));
+            Row::new(cells)
+        })
+        .collect();
+
+    let mut header_cells: Vec<&str> = Vec::with_capacity(headers.len() + 1);
+    header_cells.push("");
+    header_cells.extend(headers.iter().copied());
+    let header = Row::new(header_cells).style(Style::default());
+
+    // The header occupies one row of the viewport; the rest fit data rows.
+    let viewport = rows.len().min(inner.height.saturating_sub(1) as usize);
+    let offset = state.slot_scroll_offset(viewport);
+    let visible: Vec<Row> = rows[offset..offset + viewport].to_vec();
+
+    let table = ratatui::widgets::Table::new(visible, widths)
+        .header(header)
+        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    f.render_widget(table, inner);
+}
+
+/// Responsive slot columns: (header labels, column widths). A leading
+/// marker column (the selection indicator) is prepended by the caller.
+/// Fewer columns as the width shrinks; the minimum (80-wide terminal)
+/// keeps ID, State, Phase, and Context.
+fn slot_columns(width: usize) -> (Vec<&'static str>, Vec<Constraint>) {
+    // (headers, minimum widths). The marker column is always 3 wide.
+    let (headers, min): (Vec<&'static str>, Vec<usize>) = if width >= 100 {
+        (vec!["ID", "State", "Phase", "Prompt", "Generated", "Context"], vec![4, 8, 11, 9, 10, 9])
+    } else if width >= 88 {
+        (vec!["ID", "State", "Phase", "Prompt", "Context"], vec![4, 8, 11, 9, 9])
+    } else {
+        (vec!["ID", "State", "Phase", "Context"], vec![4, 8, 11, 9])
+    };
+    let marker_width = 3usize;
+    let total_min: usize = min.iter().sum::<usize>() + marker_width;
+    let extra = width.saturating_sub(total_min);
+    let data_total: usize = min.iter().sum();
+    let mut widths: Vec<Constraint> = Vec::with_capacity(min.len() + 1);
+    widths.push(Constraint::Length(marker_width as u16));
+    for m in &min {
+        let share = extra.saturating_mul(*m).saturating_div(data_total.max(1));
+        widths.push(Constraint::Length((*m as u16).saturating_add(share as u16)));
+    }
+    (headers, widths)
+}
+
+/// One slot's cell values, aligned with the active column set. Missing
+/// counters render as the placeholder, never as 0.
+fn slot_cell_values(slot: &SlotSnapshot, symbols: &Symbols, n_data_cols: usize) -> Vec<String> {
+    let state_str = if slot.is_processing { "ACTIVE" } else { "IDLE" };
+    let phase = slot.phase.display();
+    let prompt = format_int(slot.n_prompt_tokens, symbols);
+    let generated = format_int(slot.n_decoded, symbols);
+    let context = format_int(slot.n_ctx, symbols);
+    // Column sets mirror `slot_columns`: wide has Generated, the others
+    // drop it; compact also drops Prompt.
+    match n_data_cols {
+        6 => vec![slot.id.to_string(), state_str.into(), phase.into(), prompt, generated, context],
+        5 => vec![slot.id.to_string(), state_str.into(), phase.into(), prompt, context],
+        _ => vec![slot.id.to_string(), state_str.into(), phase.into(), context],
+    }
+}
+
+/// Compact integer format: 999, 1.2K, 187.8K, 1.5M. Missing -> placeholder.
+fn format_int(v: Option<u64>, symbols: &Symbols) -> String {
+    match v {
+        None => placeholder(symbols).to_string(),
+        Some(n) => {
+            if n >= 1_000_000 {
+                format!("{:.1}M", n as f64 / 1_000_000.0)
+            } else if n >= 1_000 {
+                format!("{:.1}K", n as f64 / 1_000.0)
+            } else {
+                n.to_string()
+            }
+        }
+    }
 }
 
 /// Waiting view: first snapshot not yet received.
@@ -315,17 +440,26 @@ fn render_connection_view(
 /// Footer: only keys that are actually available right now are advertised.
 /// `p` appears once a snapshot exists (pause is ignored before that), and
 /// reads "Resume" while paused so the label matches the action it triggers.
-fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
+/// The slot-navigation keys appear only when slot selection is usable
+/// (`/slots` available and at least one slot visible); they are named
+/// `↑/↓` in Unicode mode and `j`/`k` in ASCII mode.
+fn render_footer(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let footer = if state.can_pause() {
+    let mut footer = " q Quit   r Reconnect".to_string();
+    if state.can_pause() {
         let action = if state.paused { "p Resume" } else { "p Pause" };
-        format!(" q Quit   r Reconnect   {action} ")
-    } else {
-        " q Quit   r Reconnect ".to_string()
-    };
-    let text = Paragraph::new(footer).alignment(Alignment::Center);
+        footer.push_str("   ");
+        footer.push_str(action);
+    }
+    if state.can_select_slot() {
+        let keys = if symbols.is_ascii() { "j/k" } else { "↑/↓" };
+        footer.push_str("   ");
+        footer.push_str(keys);
+        footer.push_str(" Select");
+    }
+    let text = Paragraph::new(format!(" {} ", footer)).alignment(Alignment::Center);
     f.render_widget(text, area);
 }
 

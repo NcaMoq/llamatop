@@ -15,14 +15,21 @@ basic interactive TUI:
 - `llamatop snapshot` — one-shot capture (human-readable or pure JSON)
 - `llamatop` (no subcommand) — interactive TUI with a header panel
   (connection, backend, model, server state, workload phase, active/queued
-  requests, update age) and an inference panel (prompt/generation throughput,
-  active/queued, context size, slot count, speculative acceptance rate)
+  requests, update age), an inference panel (prompt/generation throughput,
+  active/queued, context size, slot count, speculative acceptance rate), and
+  a slot monitoring table (stable ID order, slot selection, vertical
+  scrolling, and responsive columns: wide/standard/compact by terminal
+  width)
 
-TUI controls: `q` quit, `r` reconnect, `p` pause/resume. The terminal must be
-at least 80x20; smaller windows show a "too small" notice. Missing values are
-rendered as a placeholder, never as 0. `--ascii` forces an ASCII-only
-rendering. Slot tables, history graphs, the event log, GPU/system monitoring,
-and the help modal are not yet implemented.
+TUI controls: `q` quit, `r` reconnect, `p` pause/resume, and `↑`/`↓` (or
+`j`/`k`) to move the slot selection. The slot keys are advertised in the
+footer only when the `/slots` endpoint is available and at least one slot is
+reported; "Slots unavailable" (endpoint absent) and "No slots reported"
+(zero slots) are distinct views. The terminal must be at least 80x20; smaller
+windows show a "too small" notice. Missing values are rendered as a
+placeholder, never as 0. `--ascii` forces an ASCII-only rendering. The slot
+detail view, history graphs, the event log, GPU/system monitoring, and the
+help modal are not yet implemented.
 
 ## Requirements
 

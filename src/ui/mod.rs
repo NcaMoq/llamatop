@@ -65,6 +65,7 @@ pub async fn run_tui(config: &Config) -> anyhow::Result<i32> {
 mod tests {
     use super::*;
     use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState, WorkloadPhase};
+    use unicode_width::UnicodeWidthChar;
 
     /// Render one frame and return the flattened cell text.
     fn render_content(state: &AppState, ascii: bool, width: u16, height: u16) -> String {
@@ -365,5 +366,255 @@ mod tests {
         assert!(content.contains("999.0 tok/s"));
         // Generation has neither delta nor reported value: placeholder.
         assert!(content.contains("—"));
+    }
+
+    // --- Step 5: slot table tests ---
+
+    /// A slot for rendering tests: only the fields the table shows.
+    fn slot(id: u32, processing: bool, ctx: Option<u64>) -> crate::domain::SlotSnapshot {
+        crate::domain::SlotSnapshot {
+            id,
+            task_id: None,
+            is_processing: processing,
+            n_ctx: ctx,
+            n_tokens: None,
+            n_prompt_tokens: None,
+            n_prompt_tokens_processed: None,
+            n_decoded: None,
+            speculative: false,
+            phase: if processing {
+                crate::domain::SlotPhase::Decode
+            } else {
+                crate::domain::SlotPhase::Idle
+            },
+        }
+    }
+
+    /// Connected/ready state with the /slots capability enabled.
+    fn connected_slots(overrides: impl FnOnce(&mut BackendSnapshot)) -> AppState {
+        let mut state = connected_ready(overrides);
+        state.apply_capabilities(crate::backend::BackendCapabilities {
+            slots: true,
+            metrics: true,
+            ..Default::default()
+        });
+        state
+    }
+
+    /// Split flattened render content into rows using display width, so
+    /// per-row assertions work in Unicode mode (multi-byte symbols).
+    fn split_rows(content: &str, width: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut cur = String::new();
+        let mut w = 0usize;
+        for ch in content.chars() {
+            cur.push(ch);
+            w += ch.width().unwrap_or(0);
+            if w == width {
+                rows.push(std::mem::take(&mut cur));
+                w = 0;
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn slots_unavailable_view_when_endpoint_missing() {
+        // Default capabilities: /slots not probed/available.
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Slots unavailable"));
+        assert!(content.contains("Per-slot monitoring will not be available."));
+        // Distinct from the zero-slots view.
+        assert!(!content.contains("No slots reported"));
+    }
+
+    #[test]
+    fn no_slots_reported_view_when_empty() {
+        let state = connected_slots(|_| {}); // capability on, zero slots
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("No slots reported"));
+        assert!(!content.contains("Slots unavailable"));
+    }
+
+    #[test]
+    fn slot_table_shows_idle_slot() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(0, false, Some(16_384))];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("IDLE"));
+        assert!(content.contains("16.4K"), "context must be compact-formatted");
+    }
+
+    #[test]
+    fn slot_table_shows_active_decode_slot() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(3, true, Some(8_192))];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("ACTIVE"));
+        assert!(content.contains("DECODE"));
+        assert!(content.contains("8.2K"));
+    }
+
+    #[test]
+    fn slot_rows_render_in_id_order() {
+        // Deliberately out of API order; distinct context values mark rows.
+        let state = connected_slots(|s| {
+            s.slots = vec![
+                slot(2, false, Some(300)),
+                slot(0, false, Some(100)),
+                slot(1, false, Some(200)),
+            ];
+        });
+        let content = render_content(&state, false, 80, 20);
+        let p100 = content.find("100").expect("slot 0 row visible");
+        let p200 = content.find("200").expect("slot 1 row visible");
+        let p300 = content.find("300").expect("slot 2 row visible");
+        assert!(p100 < p200 && p200 < p300, "rows must be ordered by slot ID, not API order");
+    }
+
+    #[test]
+    fn selected_slot_row_is_marked_and_marker_follows_selection() {
+        let mut state = connected_slots(|s| {
+            s.slots = vec![
+                slot(0, false, Some(111)),
+                slot(1, false, Some(222)),
+                slot(2, false, Some(333)),
+            ];
+        });
+        // Initially the first row (id 0, ctx 111) is selected.
+        let content = render_content(&state, false, 80, 20);
+        let lines = split_rows(&content, 80);
+        let row111 = lines.iter().find(|l| l.contains("111")).expect("row visible");
+        assert!(row111.contains('▶'), "first row must carry the selection marker");
+
+        state.handle_input(crate::app::event::InputAction::SlotDown);
+        let content = render_content(&state, false, 80, 20);
+        let lines = split_rows(&content, 80);
+        let row222 = lines.iter().find(|l| l.contains("222")).expect("row visible");
+        assert!(row222.contains('▶'), "marker must move to the selected row");
+        let row111 = lines.iter().find(|l| l.contains("111")).expect("row visible");
+        assert!(!row111.contains('▶'));
+    }
+
+    #[test]
+    fn selected_row_stays_visible_while_scrolling() {
+        // 10 slots; at 80x20 the table fits 5 data rows.
+        let mut state = connected_slots(|s| {
+            s.slots = (0..10).map(|i| slot(101 + i, false, Some(16_384))).collect();
+        });
+        for _ in 0..9 {
+            state.handle_input(crate::app::event::InputAction::SlotDown);
+        }
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("110"), "selected last row must be visible");
+        assert!(content.contains("106"), "first visible row");
+        assert!(!content.contains("101"), "scrolled-away rows must not render");
+        assert!(!content.contains("105"));
+        assert!(content.contains('▶'));
+    }
+
+    #[test]
+    fn long_slot_list_renders_without_panic() {
+        let state = connected_slots(|s| {
+            s.slots = (0..200).map(|i| slot(i, false, Some(4_096))).collect();
+        });
+        let _ = render_content(&state, false, 80, 20);
+        let _ = render_content(&state, true, 80, 20);
+    }
+
+    #[test]
+    fn wide_width_shows_generated_column() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(0, false, Some(16_384))];
+        });
+        // Inner width 106 >= 100: wide column set.
+        let wide = render_content(&state, false, 108, 30);
+        assert!(wide.contains("Generated"));
+        // The standard (88-99 inner) set has no Generated column.
+        let standard = render_content(&state, false, 90, 20);
+        assert!(!standard.contains("Generated"));
+        let compact = render_content(&state, false, 80, 20);
+        assert!(!compact.contains("Generated"));
+    }
+
+    #[test]
+    fn ascii_slot_table_uses_ascii_markers_and_placeholders() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(7, false, None)]; // missing context -> placeholder
+        });
+        let ascii = render_content(&state, true, 80, 20);
+        assert!(!ascii.contains('▶'));
+        assert!(!ascii.contains('—'));
+        assert!(ascii.contains('>'), "ASCII selection marker");
+        let lines = split_rows(&ascii, 80);
+        let row = lines.iter().find(|l| l.contains("7")).expect("row visible");
+        assert!(row.contains('-'), "missing context renders '-' in the slot row");
+    }
+
+    #[test]
+    fn missing_slot_values_render_placeholder_not_zero() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(77, false, None)];
+        });
+        let content = render_content(&state, false, 80, 20);
+        let lines = split_rows(&content, 80);
+        let row = lines.iter().find(|l| l.contains("77")).expect("row visible");
+        assert!(row.contains('—'), "unreported slot counters must show the em-dash, not 0");
+    }
+
+    #[test]
+    fn paused_slot_table_shows_frozen_slots() {
+        let mut state = connected_slots(|s| {
+            s.slots = vec![slot(101, false, Some(1_000))];
+        });
+        state.handle_input(crate::app::event::InputAction::TogglePause);
+        assert!(state.paused);
+        // New data arrives while paused.
+        let mut snap =
+            BackendSnapshot { connection: ConnectionState::Connected, ..Default::default() };
+        snap.slots = vec![slot(202, true, Some(2_000))];
+        state.apply_snapshot(snap);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("101"), "frozen slot must stay visible");
+        assert!(!content.contains("202"));
+        assert!(content.contains("PAUSED"));
+    }
+
+    #[test]
+    fn footer_shows_slot_select_keys_when_slots_available() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot(0, false, None)];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("↑/↓ Select"));
+        let ascii = render_content(&state, true, 80, 20);
+        assert!(ascii.contains("j/k Select"));
+    }
+
+    #[test]
+    fn footer_hides_slot_select_keys_when_unavailable_or_empty() {
+        // /slots endpoint unavailable: no select control.
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        assert!(!content.contains("Select"));
+        // Endpoint available but zero slots: still no select control.
+        let state = connected_slots(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        assert!(!content.contains("Select"));
+    }
+
+    #[test]
+    fn slot_table_at_80x20_does_not_panic() {
+        let state = connected_slots(|s| {
+            s.slots = (0..5).map(|i| slot(i, i % 2 == 1, Some(32_768))).collect();
+        });
+        let _ = render_content(&state, false, 80, 20);
+        let _ = render_content(&state, true, 80, 20);
+        // Too-small and degenerate sizes keep their existing guarantees.
+        let _ = render_content(&state, false, 62, 16);
+        let _ = render_content(&state, false, 1, 1);
     }
 }

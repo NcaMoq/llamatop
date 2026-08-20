@@ -98,7 +98,13 @@ async fn run_tui(cli: &Cli) -> anyhow::Result<i32> {
 
 /// Load and validate configuration.
 fn load_config(cli: &Cli) -> Result<llamatop::config::Config, llamatop::error::ConfigError> {
-    llamatop::config::Config::load(cli.endpoint.as_deref(), cli.ascii, cli.no_gpu, cli.refresh_ms)
+    llamatop::config::Config::load(
+        cli.endpoint.as_deref(),
+        cli.ascii,
+        cli.no_gpu,
+        cli.no_system,
+        cli.refresh_ms,
+    )
 }
 
 /// Format an anyhow error for human-facing output: outer context plus the

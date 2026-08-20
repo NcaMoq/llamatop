@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_gpu: bool,
 
+    /// Disable host + llama-server process monitoring
+    #[arg(long, global = true)]
+    pub no_system: bool,
+
     /// Snapshot refresh interval in milliseconds (minimum: 100)
     #[arg(long, global = true, value_name = "MS")]
     pub refresh_ms: Option<u64>,
@@ -66,6 +70,7 @@ mod tests {
         assert!(cli.command.is_none());
         assert!(!cli.ascii);
         assert!(!cli.no_gpu);
+        assert!(!cli.no_system);
         assert!(cli.endpoint.is_none());
     }
 

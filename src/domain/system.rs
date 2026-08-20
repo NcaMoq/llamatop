@@ -8,7 +8,14 @@ pub struct SystemSnapshot {
     pub cpu_usage_percent: Option<f64>,
     pub ram_used_bytes: Option<u64>,
     pub ram_total_bytes: Option<u64>,
+    /// `Some` only when exactly one matching llama-server process exists:
+    /// with several candidates the endpoint association cannot be confirmed,
+    /// so no single process is presented as the server.
     pub process: Option<ProcessSnapshot>,
+    /// How many processes on this host match the llama-server name
+    /// (0 = none found). `None` when the process list could not be read.
+    #[serde(default)]
+    pub process_match_count: Option<u32>,
 }
 
 impl SystemSnapshot {
@@ -59,6 +66,7 @@ mod tests {
             ram_used_bytes: None,
             ram_total_bytes: Some(1000),
             process: None,
+            process_match_count: None,
         };
         assert!(s.ram_utilization().is_none());
     }

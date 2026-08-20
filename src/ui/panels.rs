@@ -19,7 +19,9 @@ use crate::app::history::HistorySample;
 use crate::app::log::{EventRecord, EventSeverity};
 use crate::app::state::AppState;
 use crate::display::Symbols;
-use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState, SlotSnapshot};
+use crate::domain::{
+    BackendSnapshot, Confidence, ConnectionState, ServerState, SlotSnapshot, SystemSnapshot,
+};
 
 /// Minimum size at which the full panel layout is rendered.
 pub const MIN_WIDTH: u16 = 80;
@@ -86,42 +88,53 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                     match s.connection {
                         ConnectionState::Connected => {
                             // Middle area: inference (fixed), the slot table
-                            // (variable), the history panel (as much as the
-                            // remaining space allows; hidden when it would
-                            // squeeze the slot table), and the status/warning
-                            // area (only as many lines as it has content).
+                            // (variable), the detail panel (history, or the
+                            // event log when toggled), the Resources panel
+                            // (host + llama-server process, when enabled),
+                            // and the status/warning area.
                             let status_count = status_lines(state, symbols).len();
                             let free = chunks[1]
                                 .height
                                 .saturating_sub(6)
                                 .saturating_sub(status_count as u16);
-                            // The slot table keeps its full 5 data rows at
-                            // 80x20 (history has the lowest priority there
-                            // and is hidden). History tiers as space allows
-                            // (block height = inner content + 2 borders):
+                            // Resources is a compact 4-row block (2 borders +
+                            // 2 content lines) with the LOWEST layout
+                            // priority. At 80x20 (free=8) and 100x30 (free=18)
+                            // it is hidden so the slot table keeps its full
+                            // rows and the history keeps its full layout; it
+                            // appears only when the terminal is tall enough
+                            // (free >= 19) that the full 9-row history still
+                            // fits alongside it.
+                            let resources_h = if state.show_system && free >= 19 { 4 } else { 0 };
+                            let detail_budget = free.saturating_sub(resources_h);
+                            // The remaining space is shared by the detail
+                            // panel. History tiers as space allows (block
+                            // height = inner content + 2 borders):
                             // 9 = full (legend + 2-row bars + sparklines),
                             // 6 = one row per series, 4 = two series rows,
                             // 3 = one summary row, 0 = hidden.
-                            let history_h = match free {
+                            let history_h = match detail_budget {
                                 f if f >= 15 => 9,
                                 f if f >= 12 => 6,
                                 f if f >= 10 => 4,
                                 f if f >= 9 => 3,
                                 _ => 0,
                             };
-                            // The bottom detail panel shows either the
-                            // history (default) or the event log (when the
-                            // user toggled it with `l`). The event log is
-                            // explicitly requested, so it takes the free
-                            // space but always reserves room for the slot
-                            // table to keep its header + one row (the 80x20
-                            // guarantee); history keeps its lower priority.
-                            let detail_h =
-                                if state.show_events { free.saturating_sub(4) } else { history_h };
+                            // The detail panel shows either the history
+                            // (default) or the event log (toggled with `l`).
+                            // The event log is explicitly requested, so it
+                            // takes the free space but reserves room for the
+                            // slot table to keep its header + one row.
+                            let detail_h = if state.show_events {
+                                detail_budget.saturating_sub(4)
+                            } else {
+                                history_h
+                            };
                             let mid = Layout::vertical([
                                 Constraint::Length(6),
                                 Constraint::Min(1),
                                 Constraint::Length(detail_h),
+                                Constraint::Length(resources_h),
                                 Constraint::Length(status_count as u16),
                             ])
                             .split(chunks[1]);
@@ -134,7 +147,10 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                                     render_history(f, mid[2], state, symbols);
                                 }
                             }
-                            render_status(f, mid[3], state, symbols);
+                            if resources_h > 0 {
+                                render_resources(f, mid[3], state, symbols);
+                            }
+                            render_status(f, mid[4], state, symbols);
                         }
                         _ => render_connection_view(f, chunks[1], state, s, symbols),
                     }
@@ -433,6 +449,112 @@ fn severity_symbol(severity: EventSeverity, symbols: &Symbols) -> &'static str {
         EventSeverity::Info => symbols.idle(),
         EventSeverity::Warning => symbols.warning(),
         EventSeverity::Error => symbols.error(),
+    }
+}
+
+/// Resources panel (Phase D): host CPU/RAM and the llama-server process.
+///
+/// Missing values render as the placeholder, never 0. The process row is
+/// only shown when exactly one candidate matched (`identity == Exact`);
+/// with several candidates the endpoint association is not confirmed, so the
+/// panel reports the candidate count instead of naming a process.
+fn render_resources(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
+    let block = Block::bordered().title(" Resources ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let sys = match &state.system {
+        Some(s) => s,
+        None => {
+            let text = Paragraph::new(vec![
+                Line::from(format!("{} System monitor unavailable", symbols.warning())),
+                Line::from("Host and process metrics are not being sampled."),
+            ]);
+            f.render_widget(text, inner);
+            return;
+        }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Line 1: host CPU + RAM.
+    let cpu = format_percent_value(sys.cpu_usage_percent, symbols);
+    let ram = ram_display(sys.ram_used_bytes, sys.ram_total_bytes, symbols);
+    lines.push(Line::from(format!("CPU {cpu}   RAM {ram}")));
+
+    // Line 2: the llama-server process, or a candidate-count note.
+    let process_line = process_line(sys, symbols);
+    lines.push(Line::from(process_line));
+
+    let text = Paragraph::new(lines);
+    f.render_widget(text, inner);
+}
+
+/// "RAM used/total (pct)" or placeholder when either value is missing.
+fn ram_display(used: Option<u64>, total: Option<u64>, symbols: &Symbols) -> String {
+    match (used, total) {
+        (Some(u), Some(t)) if t > 0 => {
+            let pct = (u as f64 / t as f64) * 100.0;
+            format!("{}/{} ({pct:.0}%)", bytes(u), bytes(t))
+        }
+        _ => placeholder(symbols).to_string(),
+    }
+}
+
+/// The llama-server process row. Never claims an endpoint association for a
+/// process we cannot confirm is the server.
+fn process_line(sys: &SystemSnapshot, symbols: &Symbols) -> String {
+    match (&sys.process, sys.process_match_count) {
+        (Some(p), _) => {
+            let cpu = format_percent_value(p.cpu_usage_percent, symbols);
+            let mem = match p.memory_bytes {
+                Some(m) => bytes(m),
+                None => placeholder(symbols).to_string(),
+            };
+            let up = match p.uptime_secs {
+                Some(s) => human_secs(s),
+                None => placeholder(symbols).to_string(),
+            };
+            format!("{} {} CPU {} Mem {} Up {}", symbols.active(), p.name, cpu, mem, up)
+        }
+        // Several candidates: we cannot say which one the endpoint is.
+        (None, Some(n)) if n > 1 => {
+            format!("{} {n} llama-server processes; endpoint not associated", symbols.warning())
+        }
+        // No matching process (0, or a defensive 1 with no process record):
+        // HTTP monitoring continues; the process row is a neutral note.
+        (None, Some(_)) => "llama-server process not found".to_string(),
+        // The process list could not be read at all.
+        (None, None) => "llama-server process: unavailable".to_string(),
+    }
+}
+
+/// Compact byte format: 999, 1.2K, 187.8M, 1.5G.
+fn bytes(v: u64) -> String {
+    const UNITS: [&str; 4] = ["", "K", "M", "G"];
+    let mut value = v as f64;
+    let mut idx = 0;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{v}")
+    } else {
+        format!("{value:.1}{}", UNITS[idx])
+    }
+}
+
+/// Human uptime: "12 m", "1 h 4 m", "36 s".
+fn human_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{} m", secs / 60)
+    } else {
+        format!("{} h {} m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -892,6 +1014,14 @@ fn format_percent(v: Option<f64>, symbols: &Symbols) -> String {
     }
 }
 
+/// Format a value that is already a 0-100 percentage (host/process CPU).
+fn format_percent_value(v: Option<f64>, symbols: &Symbols) -> String {
+    match v {
+        Some(p) => format!("{p:.1}%"),
+        None => placeholder(symbols).to_string(),
+    }
+}
+
 /// "320 ms ago" / "2.1 s ago" / "3 min ago", or placeholder when never.
 fn update_age(state: &AppState, symbols: &Symbols) -> String {
     match state.last_update_age_ms(Instant::now()) {
@@ -905,6 +1035,7 @@ fn update_age(state: &AppState, symbols: &Symbols) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{ProcessIdentity, ProcessSnapshot};
 
     #[test]
     fn trunc_keeps_short_strings_intact() {
@@ -994,5 +1125,84 @@ mod tests {
         assert_eq!(trunc("…x…", 3, true), "…x…");
         assert_eq!(trunc("…x…", 10, true), "…x…");
         assert_eq!(trunc("日本語", 6, false), "日本語");
+    }
+
+    // --- Phase D: resources panel helpers ---
+
+    #[test]
+    fn bytes_compact_format() {
+        assert_eq!(bytes(999), "999");
+        assert_eq!(bytes(1234), "1.2K");
+        assert_eq!(bytes(187_800_000), "179.1M");
+        assert_eq!(bytes(1_500_000_000), "1.4G");
+    }
+
+    #[test]
+    fn human_secs_format() {
+        assert_eq!(human_secs(36), "36 s");
+        assert_eq!(human_secs(720), "12 m");
+        assert_eq!(human_secs(3720), "1 h 2 m");
+    }
+
+    #[test]
+    fn ram_display_requires_both_values() {
+        let sym = Symbols::new(false);
+        assert_eq!(ram_display(Some(50), Some(100), &sym), "50/100 (50%)");
+        assert_eq!(ram_display(None, Some(100), &sym), "—");
+        assert_eq!(ram_display(Some(50), Some(0), &sym), "—");
+    }
+
+    #[test]
+    fn process_line_never_fabricates_association() {
+        let sym = Symbols::new(false);
+        // Exactly one match: the process is shown.
+        let snap = SystemSnapshot {
+            cpu_usage_percent: None,
+            ram_used_bytes: None,
+            ram_total_bytes: None,
+            process_match_count: Some(1),
+            process: Some(ProcessSnapshot {
+                pid: 42,
+                name: "llama-server.exe".into(),
+                cpu_usage_percent: Some(9.0),
+                memory_bytes: Some(29_650_837_504),
+                uptime_secs: Some(8372),
+                identity: ProcessIdentity::Exact,
+            }),
+        };
+        let line = process_line(&snap, &sym);
+        assert!(line.contains("llama-server.exe"));
+        assert!(line.contains("27.6G"), "process memory is GiB: {line}");
+        assert!(!line.contains("not associated"), "a single exact match is not ambiguous");
+
+        // Several candidates: no process is named.
+        let multi = SystemSnapshot {
+            process_match_count: Some(3),
+            process: None,
+            ..SystemSnapshot {
+                cpu_usage_percent: None,
+                ram_used_bytes: None,
+                ram_total_bytes: None,
+                process: None,
+                process_match_count: None,
+            }
+        };
+        let line = process_line(&multi, &sym);
+        assert!(line.contains("3 llama-server processes"));
+        assert!(line.contains("not associated"));
+        assert!(!line.contains("llama-server.exe"), "no candidate is named");
+
+        // Zero matches: neutral note.
+        let none = SystemSnapshot {
+            process_match_count: Some(0),
+            ..SystemSnapshot {
+                cpu_usage_percent: None,
+                ram_used_bytes: None,
+                ram_total_bytes: None,
+                process: None,
+                process_match_count: None,
+            }
+        };
+        assert_eq!(process_line(&none, &sym), "llama-server process not found");
     }
 }

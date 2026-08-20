@@ -104,6 +104,7 @@ impl Config {
         cli_endpoint: Option<&str>,
         cli_ascii: bool,
         cli_no_gpu: bool,
+        cli_no_system: bool,
         cli_refresh_ms: Option<u64>,
     ) -> ConfigResult<Config> {
         let mut config = Self::default();
@@ -126,6 +127,9 @@ impl Config {
         }
         if cli_no_gpu {
             config.show_gpu = false;
+        }
+        if cli_no_system {
+            config.show_system = false;
         }
         if let Some(refresh_ms) = cli_refresh_ms {
             config.refresh_interval_ms = refresh_ms;
@@ -328,14 +332,23 @@ mod tests {
     fn cli_overrides_env_and_file() {
         // Simulate env endpoint
         std::env::set_var(ENV_ENDPOINT, "http://127.0.0.1:7777");
-        let config = Config::load(Some("http://127.0.0.1:8888"), false, false, None).unwrap();
+        let config =
+            Config::load(Some("http://127.0.0.1:8888"), false, false, false, None).unwrap();
         assert_eq!(config.endpoint, "http://127.0.0.1:8888");
 
-        let config = Config::load(None, false, false, None).unwrap();
+        let config = Config::load(None, false, false, false, None).unwrap();
         assert_eq!(config.endpoint, "http://127.0.0.1:7777");
 
         std::env::remove_var(ENV_ENDPOINT);
-        let config = Config::load(None, false, false, Some(200)).unwrap();
+        let config = Config::load(None, false, false, false, Some(200)).unwrap();
         assert_eq!(config.refresh_interval_ms, 200);
+    }
+
+    #[test]
+    fn cli_no_system_disables_system_monitor() {
+        let config = Config::load(None, false, false, false, None).unwrap();
+        assert!(config.show_system, "system monitoring is on by default");
+        let config = Config::load(None, false, false, true, None).unwrap();
+        assert!(!config.show_system, "--no-system must disable the monitor");
     }
 }

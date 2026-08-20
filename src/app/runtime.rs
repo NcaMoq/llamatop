@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::app::event::{AppEvent, CollectorCommand};
 use crate::app::state::AppState;
 use crate::collector::backend;
+use crate::collector::system as system_monitor;
 use crate::config::Config;
 
 /// Draw cadence: at most 10 FPS.
@@ -38,33 +39,63 @@ pub async fn run(
     let mut state = AppState::new(&config);
     state.terminal_size = initial_size;
 
+    // The optional host + process monitor (Phase D). It is a separate sender
+    // on the same event channel, so it must be stopped before the loop's
+    // receiver can see "all senders dropped". Disabled by config.
+    let system_monitor = if config.show_system {
+        let provider = system_monitor::shared(system_monitor::SysinfoProvider::new());
+        Some(system_monitor::start(
+            provider,
+            events_tx.clone(),
+            system_monitor::SYSTEM_SAMPLE_INTERVAL,
+        ))
+    } else {
+        None
+    };
+
     let (commands_tx, commands_rx) = unbounded_channel::<CollectorCommand>();
     let collector = tokio::spawn(backend::run(config, events_tx, commands_rx));
 
     let run_result = run_event_loop(&mut state, &mut events_rx, &commands_tx, &mut draw).await;
 
-    // Mandatory cleanup, independent of how the loop ended: stop the
-    // collector and join it so no detached task survives, even after a
-    // draw/command failure.
+    // Mandatory cleanup, independent of how the loop ended: stop and join
+    // both the monitor and the collector so no detached task survives, even
+    // after a draw/command failure.
+    let monitor_joined = match system_monitor {
+        Some((stop_tx, handle)) => {
+            let _ = stop_tx.send(());
+            handle.await
+        }
+        None => Ok(()),
+    };
     let _ = commands_tx.send(CollectorCommand::Stop);
     let joined = collector.await;
 
-    finish_run(run_result, joined)
+    finish_run(run_result, joined, monitor_joined)
 }
 
-/// Combine the event-loop result with the collector join.
+/// Combine the event-loop result with the collector and monitor joins.
 ///
 /// - The loop's own error always wins: cleanup failures never mask it.
-/// - A collector panic (join error) on an otherwise clean exit is reported
-///   as a runtime error instead of silently returning success.
+/// - A collector or monitor panic (join error) on an otherwise clean exit is
+///   reported as a runtime error instead of silently returning success.
 fn finish_run(
     run_result: anyhow::Result<i32>,
     joined: Result<(), tokio::task::JoinError>,
+    monitor_joined: Result<(), tokio::task::JoinError>,
 ) -> anyhow::Result<i32> {
-    match (run_result, joined) {
-        (Ok(code), Ok(())) => Ok(code),
-        (Ok(_), Err(err)) => Err(anyhow::anyhow!("collector task failed during shutdown: {err}")),
-        (Err(err), _) => Err(err),
+    match (run_result, joined, monitor_joined) {
+        (Ok(code), Ok(()), Ok(())) => Ok(code),
+        (Ok(_), Err(err), Ok(())) => {
+            Err(anyhow::anyhow!("collector task failed during shutdown: {err}"))
+        }
+        (Ok(_), Ok(()), Err(err)) => {
+            Err(anyhow::anyhow!("system monitor failed during shutdown: {err}"))
+        }
+        (Ok(_), Err(err), Err(_)) => {
+            Err(anyhow::anyhow!("collector task failed during shutdown: {err}"))
+        }
+        (Err(err), _, _) => Err(err),
     }
 }
 
@@ -119,6 +150,8 @@ fn handle(state: &mut AppState, event: AppEvent) {
         AppEvent::BackendError(summary) => state.apply_error(summary),
         AppEvent::Input(action) => state.handle_input(action),
         AppEvent::Resize(width, height) => state.terminal_size = (width, height),
+        AppEvent::SystemSample(snap) => state.apply_system(snap),
+        AppEvent::SystemUnavailable => state.apply_system_unavailable(),
     }
 }
 
@@ -179,21 +212,32 @@ mod tests {
 
     #[test]
     fn finish_run_returns_clean_exit_on_success() {
-        assert_eq!(finish_run(Ok(0), Ok(())).expect("clean exit"), 0);
+        assert_eq!(finish_run(Ok(0), Ok(()), Ok(())).expect("clean exit"), 0);
     }
 
     #[tokio::test]
     async fn finish_run_reports_collector_panic_on_clean_exit() {
-        let err = finish_run(Ok(0), Err(panicking_join_error().await))
+        let err = finish_run(Ok(0), Err(panicking_join_error().await), Ok(()))
             .expect_err("a collector panic must not be silently ignored");
         assert!(err.to_string().contains("collector task failed"));
     }
 
     #[tokio::test]
+    async fn finish_run_reports_monitor_panic_on_clean_exit() {
+        let err = finish_run(Ok(0), Ok(()), Err(panicking_join_error().await))
+            .expect_err("a monitor panic must not be silently ignored");
+        assert!(err.to_string().contains("system monitor failed"));
+    }
+
+    #[tokio::test]
     async fn finish_run_keeps_loop_error_over_cleanup_error() {
         let loop_err = anyhow::anyhow!("draw failed");
-        let err =
-            finish_run(Err(loop_err), Err(panicking_join_error().await)).expect_err("has error");
+        let err = finish_run(
+            Err(loop_err),
+            Err(panicking_join_error().await),
+            Err(panicking_join_error().await),
+        )
+        .expect_err("has error");
         assert!(
             err.to_string().contains("draw failed"),
             "the loop error must not be masked by the join error: {err}"
@@ -203,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn finish_run_keeps_loop_error_over_clean_join() {
         let loop_err = anyhow::anyhow!("draw failed");
-        let err = finish_run(Err(loop_err), Ok(())).expect_err("has error");
+        let err = finish_run(Err(loop_err), Ok(()), Ok(())).expect_err("has error");
         assert!(err.to_string().contains("draw failed"));
     }
 

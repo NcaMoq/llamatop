@@ -11,7 +11,7 @@
 //! collector never writes into the state directly.
 
 use crate::backend::BackendCapabilities;
-use crate::domain::BackendSnapshot;
+use crate::domain::{BackendSnapshot, SystemSnapshot};
 
 /// Events flowing into the application task.
 #[derive(Debug)]
@@ -28,6 +28,10 @@ pub enum AppEvent {
     Input(InputAction),
     /// The terminal was resized to `(width, height)`.
     Resize(u16, u16),
+    /// A host + llama-server process metrics sample (Phase D).
+    SystemSample(SystemSnapshot),
+    /// The system monitor became unavailable (Phase D).
+    SystemUnavailable,
 }
 
 /// Keyboard actions understood by the application. The mapping from raw key

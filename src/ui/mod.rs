@@ -996,4 +996,113 @@ mod tests {
         assert!(!ascii.contains('▲'));
         assert!(!ascii.contains('✘'));
     }
+
+    // --- Step 8: Resources panel tests ---
+
+    use crate::domain::{ProcessIdentity, ProcessSnapshot};
+
+    /// Connected/slots state with a controlled host + process sample.
+    fn state_with_system(sys: crate::domain::SystemSnapshot) -> AppState {
+        let mut state = connected_slots(|_| {});
+        state.show_system = true;
+        state.system = Some(sys);
+        state
+    }
+
+    #[test]
+    fn resources_panel_renders_host_and_process() {
+        let state = state_with_system(crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(42.0),
+            ram_used_bytes: Some(16_000_000_000),
+            ram_total_bytes: Some(64_000_000_000),
+            process_match_count: Some(1),
+            process: Some(ProcessSnapshot {
+                pid: 6348,
+                name: "llama-server.exe".into(),
+                cpu_usage_percent: Some(9.0),
+                memory_bytes: Some(29_650_837_504),
+                uptime_secs: Some(8372),
+                identity: ProcessIdentity::Exact,
+            }),
+        });
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("Resources"), "panel title must render");
+        assert!(content.contains("CPU 42.0%"), "host CPU shown");
+        assert!(content.contains("14.9G/59.6G"), "RAM used/total compact");
+        assert!(content.contains("llama-server.exe"), "the exact process is named");
+        assert!(content.contains("27.6G"), "process memory compact (GiB)");
+        assert!(content.contains("2 h"), "uptime human-formatted");
+        // No ambiguous-association wording for a single exact match.
+        assert!(!content.contains("not associated"));
+    }
+
+    #[test]
+    fn resources_panel_multiple_candidates_do_not_name_process() {
+        let state = state_with_system(crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(10.0),
+            ram_used_bytes: Some(1_000),
+            ram_total_bytes: Some(2_000),
+            process_match_count: Some(2),
+            process: None,
+        });
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("2 llama-server processes"));
+        assert!(content.contains("not associated"));
+    }
+
+    #[test]
+    fn resources_panel_hidden_when_disabled() {
+        let mut state = connected_slots(|_| {});
+        state.show_system = false;
+        state.system = Some(crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(5.0),
+            ram_used_bytes: None,
+            ram_total_bytes: None,
+            process_match_count: Some(1),
+            process: None,
+        });
+        let content = render_content(&state, false, 100, 40);
+        assert!(!content.contains("Resources"), "panel hidden when disabled");
+    }
+
+    #[test]
+    fn resources_panel_unavailable_shows_placeholder_note() {
+        let mut state = connected_slots(|_| {});
+        state.show_system = true;
+        state.system = None; // monitor not yet sampled / unavailable
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("Resources"));
+        assert!(content.contains("System monitor unavailable"));
+    }
+
+    #[test]
+    fn resources_panel_missing_values_use_placeholder_not_zero() {
+        let state = state_with_system(crate::domain::SystemSnapshot {
+            cpu_usage_percent: None,
+            ram_used_bytes: Some(1_000),
+            ram_total_bytes: None, // total missing -> placeholder
+            process_match_count: Some(0),
+            process: None,
+        });
+        let content = render_content(&state, false, 100, 40);
+        // CPU missing -> placeholder, RAM missing total -> placeholder.
+        assert!(content.contains("—"), "missing values must be placeholders");
+        assert!(content.contains("llama-server process not found"));
+        // A placeholder must never be rendered as a fabricated 0.0%.
+        assert!(!content.contains("CPU 0.0%"));
+    }
+
+    #[test]
+    fn resources_panel_does_not_panic_at_small_sizes() {
+        let state = state_with_system(crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(1.0),
+            ram_used_bytes: Some(1),
+            ram_total_bytes: Some(2),
+            process_match_count: Some(1),
+            process: None,
+        });
+        let _ = render_content(&state, false, 80, 20);
+        let _ = render_content(&state, false, 1, 1);
+        let _ = render_content(&state, false, 62, 16);
+    }
 }

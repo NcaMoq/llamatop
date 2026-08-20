@@ -15,7 +15,9 @@ use crate::app::history::History;
 use crate::app::log::{EventKind, EventLog, EventSeverity};
 use crate::backend::BackendCapabilities;
 use crate::config::Config;
-use crate::domain::{BackendSnapshot, ConnectionState, SlotSnapshot, WorkloadPhase};
+use crate::domain::{
+    BackendSnapshot, ConnectionState, SlotSnapshot, SystemSnapshot, WorkloadPhase,
+};
 
 /// Panels the focus cycle (Tab / Shift+Tab) moves between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,11 +29,13 @@ pub enum FocusedPanel {
     History,
     /// The event log panel.
     Events,
+    /// The Resources panel (host + llama-server process).
+    Resources,
 }
 
 impl FocusedPanel {
-    const ALL: [FocusedPanel; 3] =
-        [FocusedPanel::Slots, FocusedPanel::History, FocusedPanel::Events];
+    const ALL: [FocusedPanel; 4] =
+        [FocusedPanel::Slots, FocusedPanel::History, FocusedPanel::Events, FocusedPanel::Resources];
 
     pub fn next(self) -> Self {
         Self::ALL[(Self::ALL.iter().position(|p| *p == self).unwrap_or(0) + 1) % Self::ALL.len()]
@@ -52,10 +56,15 @@ pub struct AppState {
     // --- backend data (updated by collector events) ---
     pub latest: Option<BackendSnapshot>,
     pub capabilities: BackendCapabilities,
+    /// Latest host + llama-server process sample (Phase D). `None` until the
+    /// system monitor has produced a sample or when it is disabled.
+    pub system: Option<SystemSnapshot>,
     pub connection_message: Option<String>,
     /// Set while the last reported backend error was an authentication
     /// failure (the view then offers the env-var hint instead of a retry).
     pub authentication_failed: bool,
+    /// Whether the Resources panel (host + process) is shown (config).
+    pub show_system: bool,
 
     // --- bounded logs ---
     pub events: EventLog,
@@ -95,8 +104,10 @@ impl AppState {
             api_key_env: config.authentication.api_key_env.clone(),
             latest: None,
             capabilities: BackendCapabilities::default(),
+            system: None,
             connection_message: None,
             authentication_failed: false,
+            show_system: config.show_system,
             events: EventLog::default(),
             history,
             selected_slot: 0,
@@ -503,6 +514,24 @@ impl AppState {
         };
         self.log(severity, kind, err.message);
     }
+
+    /// Apply a host + llama-server process metrics sample (Phase D).
+    pub fn apply_system(&mut self, snap: SystemSnapshot) {
+        self.system = Some(snap);
+    }
+
+    /// The system monitor became unavailable (e.g. a sampling error). The
+    /// panel falls back to placeholders and a single warning is logged.
+    pub fn apply_system_unavailable(&mut self) {
+        if self.system.is_none() {
+            self.log(
+                EventSeverity::Warning,
+                EventKind::SystemMonitorUnavailable,
+                "System monitor unavailable",
+            );
+        }
+        self.system = None;
+    }
 }
 
 /// True when an error message is the authentication failure produced by
@@ -819,6 +848,48 @@ mod tests {
         // Normal slot navigation still works.
         s.handle_input(InputAction::SlotDown);
         assert_eq!(s.selected_slot, 1);
+    }
+
+    #[test]
+    fn system_sample_updates_state() {
+        let mut s = AppState::new(&config());
+        assert!(s.system.is_none());
+        s.apply_system(crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(3.0),
+            ram_used_bytes: Some(100),
+            ram_total_bytes: Some(200),
+            process_match_count: Some(1),
+            process: None,
+        });
+        assert!(s.system.is_some());
+        assert_eq!(s.system.as_ref().unwrap().cpu_usage_percent, Some(3.0));
+    }
+
+    #[test]
+    fn system_unavailable_logs_once_and_clears() {
+        let mut s = AppState::new(&config());
+        s.apply_system_unavailable();
+        // First unavailable: a single warning event is logged.
+        assert!(s.system.is_none());
+        assert_eq!(
+            s.events
+                .records()
+                .iter()
+                .filter(|r| r.kind == EventKind::SystemMonitorUnavailable)
+                .count(),
+            1
+        );
+        // A second call (still no data) does not add another event.
+        s.apply_system_unavailable();
+        assert_eq!(
+            s.events
+                .records()
+                .iter()
+                .filter(|r| r.kind == EventKind::SystemMonitorUnavailable)
+                .count(),
+            1,
+            "the unavailable warning must not repeat"
+        );
     }
 
     #[test]

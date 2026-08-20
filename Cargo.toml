@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 url = "2"
+sysinfo = "0.33"
 
 [dev-dependencies]
 assert_cmd = "2"

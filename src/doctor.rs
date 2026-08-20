@@ -131,7 +131,10 @@ impl Doctor {
         // Config + endpoint were already validated by Config::load, so they
         // are guaranteed good by the time we get here.
         checks.push(Check::ok("Configuration file readable"));
-        checks.push(Check::ok(format!("Endpoint URL valid ({})", self.config.endpoint)));
+        checks.push(Check::ok(format!(
+            "Endpoint URL valid ({})",
+            crate::endpoint::redact(&self.config.endpoint)
+        )));
 
         // Build the client; a malformed endpoint cannot reach this point.
         let client = match LlamaCppClient::new(

@@ -19,6 +19,7 @@ pub mod detector;
 pub mod display;
 pub mod doctor;
 pub mod domain;
+pub mod endpoint;
 pub mod error;
 pub mod logging;
 pub mod output;

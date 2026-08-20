@@ -159,14 +159,28 @@ impl Config {
         let url = Url::parse(&self.endpoint).map_err(|e| {
             ConfigError::Invalid(format!(
                 "endpoint must be a valid http(s) URL. Current value: {}. Detail: {e}",
-                self.endpoint
+                crate::endpoint::redact(&self.endpoint)
             ))
         })?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "endpoint must use the http or https scheme. Current value: {}",
-                self.endpoint
+                crate::endpoint::redact(&self.endpoint)
             )));
+        }
+        // Credentials in the URL are rejected. The API key comes only from the
+        // environment variable; any userinfo, query, or fragment could leak a
+        // secret into display, logs, or the JSON snapshot. The error text
+        // deliberately does not echo the endpoint (it may contain the secret).
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ConfigError::Invalid(
+                "endpoint must not include a username or password; provide the API key via the environment variable instead".to_string(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(ConfigError::Invalid(
+                "endpoint must not include a query string or fragment".to_string(),
+            ));
         }
 
         let intervals: [(&str, u64); 5] = [
@@ -277,6 +291,64 @@ mod tests {
         let config = Config { endpoint: "not a url".to_string(), ..Default::default() };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("valid http(s) URL"));
+    }
+
+    #[test]
+    fn endpoint_with_username_rejected() {
+        let config =
+            Config { endpoint: "http://user@example.com:8080".to_string(), ..Default::default() };
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not include a username or password"));
+        // The error must not echo the credentials or the raw endpoint.
+        assert!(!msg.contains("user@example.com"));
+        assert!(!msg.contains("example.com"));
+        assert!(!msg.contains("http://"));
+    }
+
+    #[test]
+    fn endpoint_with_password_rejected() {
+        let config = Config {
+            endpoint: "http://user:topsecret@example.com:8080".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not include a username or password"));
+        assert!(!msg.contains("topsecret"), "password must not leak into the error");
+        assert!(!msg.contains("user:"));
+    }
+
+    #[test]
+    fn endpoint_with_query_rejected() {
+        let config = Config {
+            endpoint: "http://127.0.0.1:8080/?token=secret".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not include a query string or fragment"));
+        assert!(!msg.contains("token=secret"));
+    }
+
+    #[test]
+    fn endpoint_with_fragment_rejected() {
+        let config =
+            Config { endpoint: "http://127.0.0.1:8080/#secret".to_string(), ..Default::default() };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn clean_endpoints_still_pass() {
+        for endpoint in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/",
+            "https://llama.example.com:9091/some/path",
+            "http://[::1]:8080",
+        ] {
+            let config = Config { endpoint: endpoint.to_string(), ..Default::default() };
+            assert!(config.validate().is_ok(), "{endpoint} should be accepted");
+        }
     }
 
     #[test]

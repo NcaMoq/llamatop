@@ -51,9 +51,11 @@ pub async fn capture(config: &Config) -> anyhow::Result<Snapshot> {
         config.request_timeout(),
         config.api_key().as_deref(),
     )
-    .map_err(|e| anyhow::anyhow!("cannot use endpoint {}: {e}", config.endpoint))?;
+    .map_err(|e| {
+        anyhow::anyhow!("cannot use endpoint {}: {e}", crate::endpoint::redact(&config.endpoint))
+    })?;
 
-    let endpoint = backend.endpoint().to_string();
+    let endpoint = crate::endpoint::redact(backend.endpoint());
 
     // Probe capabilities; if the server is unreachable the probe fails and we
     // fall through with default (all-unknown) capabilities. The snapshot

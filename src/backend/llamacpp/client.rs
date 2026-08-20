@@ -2,9 +2,11 @@
 //!
 //! All requests are GETs to read-only monitoring endpoints. Prompts and
 //! completions are never requested. The API key (when configured) is added
-//! per request as a sensitive `Authorization: Bearer` header; the key value
-//! is never stored in this struct, never logged, and never appears in Debug
-//! output or errors.
+//! per request as a sensitive `Authorization: Bearer` header. The key value
+//! is retained only in process memory (this struct) and is never persisted,
+//! displayed, logged, or included in Debug output or errors. The endpoint
+//! is redacted in Debug output and errors so a credential-bearing URL can
+//! never leak.
 
 use std::time::Duration;
 
@@ -16,8 +18,9 @@ use crate::error::BackendError;
 pub struct LlamaCppClient {
     base: Url,
     http: reqwest::Client,
-    /// Present when the user configured an API key; the key itself is read
-    /// from the environment variable at request time and never stored here.
+    /// Present when the user configured an API key. The value is retained in
+    /// process memory only; it is never persisted, displayed, logged, or
+    /// included in Debug output or errors.
     api_key: Option<String>,
     /// Last observed `Process-Start-Time-Unix` header value (epoch seconds).
     /// Updated after each `/metrics` fetch; used to detect server restarts.
@@ -27,7 +30,7 @@ pub struct LlamaCppClient {
 impl std::fmt::Debug for LlamaCppClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlamaCppClient")
-            .field("endpoint", &self.base.as_str())
+            .field("endpoint", &crate::endpoint::redact(self.base.as_str()))
             .field("has_api_key", &self.api_key.is_some())
             .finish_non_exhaustive()
     }
@@ -43,6 +46,16 @@ impl LlamaCppClient {
             path: "endpoint".to_string(),
             detail: "not a valid URL".to_string(),
         })?;
+        // Defense in depth: the client never retains userinfo, query, or
+        // fragment, so a credential-bearing URL cannot leak through the
+        // endpoint, Debug output, or connection errors. The config already
+        // rejects these; this strips them even if a caller bypasses it.
+        if !base.username().is_empty() || base.password().is_some() {
+            let _ = base.set_username("");
+            let _ = base.set_password(None);
+        }
+        base.set_query(None);
+        base.set_fragment(None);
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
         }
@@ -53,7 +66,7 @@ impl LlamaCppClient {
             .user_agent(format!("llamatop/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|source| BackendError::Connection {
-                endpoint: endpoint.to_string(),
+                endpoint: base.as_str().to_string(),
                 source,
             })?;
 
@@ -188,6 +201,30 @@ mod tests {
         assert!(client.has_api_key());
         // The endpoint string never contains the key.
         assert!(!client.endpoint().contains("secret"));
+    }
+
+    #[test]
+    fn client_strips_credentials_from_endpoint() {
+        // Defense in depth: even if a credential-bearing endpoint reaches the
+        // client (bypassing config validation), none of its surfaces expose
+        // the userinfo, query, or fragment.
+        let client = LlamaCppClient::new(
+            "http://user:topsecret@example.com:8080/?token=q#frag",
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("parses");
+        let endpoint = client.endpoint();
+        assert_eq!(endpoint, "http://example.com:8080/");
+        assert!(!endpoint.contains("topsecret"));
+        assert!(!endpoint.contains("token"));
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("topsecret"), "Debug leaks credentials: {debug}");
+        assert!(!debug.contains("user@"));
+        // The joined request URL also never carries the secret.
+        let joined = client.url_for("health").unwrap();
+        assert!(!joined.as_str().contains("topsecret"));
+        assert!(!joined.as_str().contains("user@"));
     }
 
     #[test]

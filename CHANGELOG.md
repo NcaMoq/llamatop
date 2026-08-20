@@ -47,3 +47,13 @@ All notable changes to llamatop are documented here.
 - Privacy guarantees: prompt/completion text is never requested, stored, or
   displayed; API keys are never displayed, logged, or written to disk;
   transport errors are redacted.
+
+### Security hardening
+
+- Endpoint URLs containing userinfo (username/password), query strings, or
+  fragments are rejected at configuration time; every display, error, Debug,
+  and JSON surface redacts the endpoint as defense in depth.
+- Local llama-server process candidates are never presented as belonging to
+  the configured endpoint: a single name match is labeled "endpoint not
+  verified", and a remote endpoint reports that local process association is
+  unavailable.

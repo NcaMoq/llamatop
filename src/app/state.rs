@@ -107,7 +107,7 @@ impl AppState {
     pub fn new(config: &Config) -> Self {
         let history = History::for_config(config.history_seconds, config.refresh_interval_ms);
         Self {
-            endpoint: config.endpoint.clone(),
+            endpoint: crate::endpoint::redact(&config.endpoint),
             api_key_env: config.authentication.api_key_env.clone(),
             latest: None,
             capabilities: BackendCapabilities::default(),

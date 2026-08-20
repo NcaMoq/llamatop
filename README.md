@@ -194,6 +194,12 @@ reported separately; a queue is not a phase.
 
 - Prompts and completions are never fetched, logged, or displayed.
 - API keys are never displayed, logged, or written to disk.
+- Endpoint URLs that contain a username or password (e.g.
+  `http://user:pass@host:8080`) are rejected at configuration time, as are
+  query strings and fragments. The API key is only ever read from the
+  environment variable named by `authentication.api_key_env`. As defense in
+  depth, every display, error, Debug, and JSON surface redacts the endpoint
+  (userinfo, query, and fragment stripped).
 - Transport errors shown in output are short, redacted descriptions.
 
 ## Development

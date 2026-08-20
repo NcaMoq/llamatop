@@ -381,10 +381,12 @@ impl AppState {
             }
         }
 
-        // History keeps recording while paused (bounded by the ring).
-        self.history.record(&snap);
+        // History keeps recording while paused (bounded by the ring); the
+        // sample timestamp matches the one reported as "last update".
+        let now = Instant::now();
+        self.history.record(&snap, now);
 
-        self.last_update = Some(Instant::now());
+        self.last_update = Some(now);
         self.latest = Some(snap);
     }
 
@@ -571,8 +573,8 @@ mod tests {
         for i in 0..10_000 {
             s.apply_snapshot(snapshot(ConnectionState::Connected, Some(i as f64)));
         }
-        assert!(s.history.generation_rate.len() <= s.history.generation_rate.capacity());
-        assert!(s.history.generation_rate.len() <= crate::app::history::MAX_HISTORY_SAMPLES);
+        assert!(s.history.len() <= s.history.capacity());
+        assert!(s.history.len() <= crate::app::history::MAX_HISTORY_SAMPLES);
     }
 
     #[test]
@@ -844,9 +846,9 @@ mod tests {
     fn clear_history_empties_series() {
         let mut s = AppState::new(&config());
         s.apply_snapshot(snapshot(ConnectionState::Connected, Some(1.0)));
-        assert!(!s.history.generation_rate.is_empty());
+        assert!(!s.history.is_empty());
         s.handle_input(InputAction::ClearHistory);
-        assert!(s.history.generation_rate.is_empty());
+        assert!(s.history.is_empty());
     }
 
     #[test]

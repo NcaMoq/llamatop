@@ -11,5 +11,5 @@ pub mod runtime;
 pub mod state;
 
 pub use event::{AppEvent, BackendErrorSummary, CollectorCommand, InputAction};
-pub use history::{FloatRing, History, MAX_HISTORY_SAMPLES};
+pub use history::{History, HistorySample, MAX_HISTORY_SAMPLES};
 pub use state::{AppLogEvent, AppState, FocusedPanel, MAX_EVENTS};

@@ -7,9 +7,11 @@
 
 pub mod event;
 pub mod history;
+pub mod log;
 pub mod runtime;
 pub mod state;
 
 pub use event::{AppEvent, BackendErrorSummary, CollectorCommand, InputAction};
 pub use history::{History, HistorySample, MAX_HISTORY_SAMPLES};
-pub use state::{AppLogEvent, AppState, FocusedPanel, MAX_EVENTS};
+pub use log::{EventKind, EventLog, EventRecord, EventSeverity};
+pub use state::{AppState, FocusedPanel};

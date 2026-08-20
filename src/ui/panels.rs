@@ -6,7 +6,7 @@
 //! helper is safe for degenerate sizes (no panic, no UTF-8 mid-character
 //! slicing) and never fabricates a value that the backend did not report.
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -16,6 +16,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::history::HistorySample;
+use crate::app::log::{EventRecord, EventSeverity};
 use crate::app::state::AppState;
 use crate::display::Symbols;
 use crate::domain::{BackendSnapshot, Confidence, ConnectionState, ServerState, SlotSnapshot};
@@ -108,17 +109,30 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                                 f if f >= 9 => 3,
                                 _ => 0,
                             };
+                            // The bottom detail panel shows either the
+                            // history (default) or the event log (when the
+                            // user toggled it with `l`). The event log is
+                            // explicitly requested, so it takes the free
+                            // space but always reserves room for the slot
+                            // table to keep its header + one row (the 80x20
+                            // guarantee); history keeps its lower priority.
+                            let detail_h =
+                                if state.show_events { free.saturating_sub(4) } else { history_h };
                             let mid = Layout::vertical([
                                 Constraint::Length(6),
                                 Constraint::Min(1),
-                                Constraint::Length(history_h),
+                                Constraint::Length(detail_h),
                                 Constraint::Length(status_count as u16),
                             ])
                             .split(chunks[1]);
                             render_inference(f, mid[0], s, symbols);
                             render_slots(f, mid[1], state, symbols);
-                            if history_h > 0 {
-                                render_history(f, mid[2], state, symbols);
+                            if detail_h > 0 {
+                                if state.show_events {
+                                    render_events(f, mid[2], state, symbols);
+                                } else {
+                                    render_history(f, mid[2], state, symbols);
+                                }
                             }
                             render_status(f, mid[3], state, symbols);
                         }
@@ -352,6 +366,94 @@ fn render_history(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols
 
     let text = Paragraph::new(lines);
     f.render_widget(text, inner);
+}
+
+/// Event log panel: bounded, redacted state-transition and user-action
+/// events, newest at the bottom by default. Repeated identical events show
+/// a `xN` suffix instead of repeating. `state.event_scroll` is the number
+/// of records hidden below the viewport (0 = newest visible); the visible
+/// window is derived each frame so a growing/shrinking log stays clamped.
+fn render_events(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) {
+    let title = if state.show_events {
+        " Events  (l hide, c clear, PgUp/PgDn scroll) "
+    } else {
+        " Events "
+    };
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let records = state.events.records();
+    if records.is_empty() {
+        let text = Paragraph::new("No events yet");
+        f.render_widget(text, inner);
+        return;
+    }
+
+    // Newest at the bottom. `state.event_scroll` is how many lines the view
+    // has scrolled up from the newest: the bottom row aligns with the record
+    // `offset` steps above the newest (offset 0 = newest at the bottom). The
+    // window is derived each frame so a growing/shrinking log stays clamped.
+    let len = records.len();
+    let offset = state.event_scroll.min(len.saturating_sub(1));
+    let end = len - offset; // exclusive end in oldest-first order
+    let count = end.min(inner.height as usize);
+    let start = end - count;
+    let window: Vec<&EventRecord> = records.iter().skip(start).take(count).collect();
+
+    let time_w = 9usize; // "123.4 s  " style width
+    let sym_w = symbols.warning().width().max(symbols.error().width());
+    let label_w = (time_w + 1 + sym_w + 1 + 4).min(inner.width as usize); // + "xNNN "
+    let msg_w = (inner.width as usize).saturating_sub(label_w);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(window.len());
+    // `window` is oldest-first, so the newest visible record lands on the
+    // last (bottom) row of the panel.
+    for rec in &window {
+        let age = event_age(rec.timestamp);
+        let sym = severity_symbol(rec.severity, symbols);
+        let repeat =
+            if rec.repeat_count > 1 { format!(" x{}", rec.repeat_count) } else { String::new() };
+        let prefix = format!("{age:>9}  {sym:<w$}  {repeat} ", w = sym_w);
+        let msg = trunc(&rec.message, msg_w.max(1), symbols.is_ascii());
+        lines.push(Line::from(format!("{prefix}{msg}")));
+    }
+
+    let text = Paragraph::new(lines);
+    f.render_widget(text, inner);
+}
+
+/// Severity symbol. The symbol is always paired with a text context (the
+/// message), never color-only, so the severity is readable without color.
+fn severity_symbol(severity: EventSeverity, symbols: &Symbols) -> &'static str {
+    match severity {
+        EventSeverity::Info => symbols.idle(),
+        EventSeverity::Warning => symbols.warning(),
+        EventSeverity::Error => symbols.error(),
+    }
+}
+
+/// Relative age of an event, in the same style as the header's
+/// "updated N ago" line (no sub-second precision: events are sparse).
+fn event_age(timestamp: SystemTime) -> String {
+    match SystemTime::now().duration_since(timestamp) {
+        Ok(d) => {
+            let secs = d.as_secs_f64();
+            if secs < 1.0 {
+                "<1 s".into()
+            } else if secs < 60.0 {
+                format!("{secs:.0} s")
+            } else if secs < 3600.0 {
+                format!("{:.0} min", secs / 60.0)
+            } else {
+                format!("{:.0} h", secs / 3600.0)
+            }
+        }
+        Err(_) => "-".to_string(),
+    }
 }
 
 /// One sparkline row: one glyph per sample. Missing -> blank (gap);
@@ -646,6 +748,13 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols)
         let action = if state.paused { "p Resume" } else { "p Pause" };
         footer.push_str("   ");
         footer.push_str(action);
+    }
+    // The event log panel (and its `l` toggle) only exists in the connected
+    // view, so it is advertised only while a connected snapshot is visible.
+    if state.visible_snapshot().map(|s| s.connection == ConnectionState::Connected).unwrap_or(false)
+    {
+        footer.push_str("   ");
+        footer.push_str("l Events");
     }
     if state.can_select_slot() {
         let keys = if symbols.is_ascii() { "j/k" } else { "↑/↓" };

@@ -18,9 +18,9 @@ use crate::app::event::{AppEvent, InputAction};
 /// Map a raw key event to an application action, if any.
 ///
 /// Only keys with an implemented, visible effect are bound. Keys whose
-/// features are not implemented yet (help modal, slot detail, event log,
-/// history clear, panel focus) map to `None` so they cannot change state or
-/// make the TUI look frozen. They are re-enabled when the feature ships.
+/// features are not implemented yet (help modal, slot detail, panel focus)
+/// map to `None` so they cannot change state or make the TUI look frozen.
+/// They are re-enabled when the feature ships.
 pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputAction> {
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(InputAction::Quit),
@@ -32,6 +32,15 @@ pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputActi
         // endpoint must be available and a slot must exist).
         KeyCode::Up | KeyCode::Char('k') => Some(InputAction::SlotUp),
         KeyCode::Down | KeyCode::Char('j') => Some(InputAction::SlotDown),
+        // Event log: `l` toggles the panel, `c` clears the visible log
+        // (or the history when it is hidden), PageUp/PageDown/Home/End
+        // scroll the log (gated to the visible log by the state).
+        KeyCode::Char('l') => Some(InputAction::ToggleEvents),
+        KeyCode::Char('c') => Some(InputAction::ClearHistory),
+        KeyCode::PageUp => Some(InputAction::LogPageUp),
+        KeyCode::PageDown => Some(InputAction::LogPageDown),
+        KeyCode::Home => Some(InputAction::LogHome),
+        KeyCode::End => Some(InputAction::LogEnd),
         _ => None,
     }
 }
@@ -134,21 +143,25 @@ mod tests {
     }
 
     #[test]
+    fn event_log_keys_are_bound() {
+        assert_eq!(key(KeyCode::Char('l')), Some(InputAction::ToggleEvents));
+        assert_eq!(key(KeyCode::Char('c')), Some(InputAction::ClearHistory));
+        assert_eq!(key(KeyCode::PageUp), Some(InputAction::LogPageUp));
+        assert_eq!(key(KeyCode::PageDown), Some(InputAction::LogPageDown));
+        assert_eq!(key(KeyCode::Home), Some(InputAction::LogHome));
+        assert_eq!(key(KeyCode::End), Some(InputAction::LogEnd));
+    }
+
+    #[test]
     fn unimplemented_keys_are_ignored() {
-        // No help modal, slot detail, event log, history clear, or panel
-        // focus is implemented yet, so none of these may map to an action.
+        // No help modal, slot detail, or panel focus is implemented yet, so
+        // none of these may map to an action.
         assert_eq!(key(KeyCode::Esc), None);
         assert_eq!(key(KeyCode::Tab), None);
         assert_eq!(key_to_action(KeyCode::Tab, KeyModifiers::SHIFT), None);
         assert_eq!(key(KeyCode::Left), None);
         assert_eq!(key(KeyCode::Right), None);
-        assert_eq!(key(KeyCode::PageUp), None);
-        assert_eq!(key(KeyCode::PageDown), None);
-        assert_eq!(key(KeyCode::Home), None);
-        assert_eq!(key(KeyCode::End), None);
         assert_eq!(key(KeyCode::Enter), None);
-        assert_eq!(key(KeyCode::Char('l')), None);
-        assert_eq!(key(KeyCode::Char('c')), None);
     }
 
     #[test]

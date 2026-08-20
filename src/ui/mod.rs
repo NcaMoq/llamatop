@@ -332,7 +332,20 @@ mod tests {
         // advertised in the waiting view.
         assert!(!content.contains("p Pause"));
         assert!(!content.contains("? Help"), "help modal is not implemented yet");
-        assert!(!content.contains("l Logs"), "event log panel is not implemented yet");
+        // The event log only exists in the connected view, so it is not
+        // advertised in the waiting view.
+        assert!(!content.contains("l Events"));
+    }
+
+    #[test]
+    fn footer_shows_events_toggle_when_connected() {
+        let state = connected_ready(|_| {});
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("l Events"));
+        // The waiting view must not advertise it.
+        let waiting = AppState::new(&Config::default());
+        let waiting_content = render_content(&waiting, false, 80, 20);
+        assert!(!waiting_content.contains("l Events"));
     }
 
     #[test]
@@ -841,5 +854,146 @@ mod tests {
             lines.iter().any(|l| l.contains("137") && l.contains("DECODE")),
             "the slot's row (ID + phase) must be visible at 80x20"
         );
+    }
+
+    // --- Step 7: event log panel tests ---
+
+    use crate::app::log::{EventKind, EventSeverity};
+
+    /// Connected/slots state with a controlled, non-empty event log and the
+    /// event panel toggled visible.
+    fn state_with_events(events: &[(EventSeverity, EventKind, &str)]) -> AppState {
+        let mut state = connected_slots(|_| {});
+        state.events.clear();
+        for (sev, kind, msg) in events {
+            state.events.push(*sev, *kind, *msg);
+        }
+        state.handle_input(crate::app::event::InputAction::ToggleEvents);
+        state
+    }
+
+    #[test]
+    fn event_panel_renders_when_toggled() {
+        let state = state_with_events(&[
+            (EventSeverity::Info, EventKind::Connected, "Connected"),
+            (EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable"),
+            (EventSeverity::Error, EventKind::Disconnected, "Connection lost"),
+        ]);
+        let content = render_content(&state, false, 100, 30);
+        assert!(
+            content.contains("PgUp/PgDn"),
+            "the event panel title (with its scroll hint) must render"
+        );
+        // Newest at the bottom: all three messages are visible.
+        assert!(content.contains("Connected"));
+        assert!(content.contains("Metrics unavailable"));
+        assert!(content.contains("Connection lost"));
+        // The newest record must sit below the oldest in the panel.
+        let lines = split_rows(&content, 100);
+        let p_first = lines
+            .iter()
+            .position(|l| l.contains("Connected") && !l.contains("PgUp/PgDn"))
+            .expect("oldest event row");
+        let p_last =
+            lines.iter().position(|l| l.contains("Connection lost")).expect("newest event row");
+        assert!(p_first < p_last, "newest event must render below the oldest");
+    }
+
+    #[test]
+    fn event_panel_is_hidden_by_default() {
+        let mut state = connected_slots(|_| {});
+        state.events.clear();
+        state.events.push(EventSeverity::Info, EventKind::Connected, "Connected");
+        assert!(!state.show_events, "events start hidden");
+        let content = render_content(&state, false, 100, 30);
+        assert!(
+            !content.contains("PgUp/PgDn"),
+            "the event panel must not render until toggled with `l`"
+        );
+        // The history panel still occupies the detail slot instead.
+        assert!(content.contains("History"));
+    }
+
+    #[test]
+    fn event_panel_shows_repeat_count_suffix() {
+        let mut state = connected_slots(|_| {});
+        state.events.clear();
+        // Push the identical event three times: collapses to one record x3.
+        for _ in 0..3 {
+            state.events.push(
+                EventSeverity::Warning,
+                EventKind::MetricsUnavailable,
+                "Metrics unavailable",
+            );
+        }
+        state.handle_input(crate::app::event::InputAction::ToggleEvents);
+        let content = render_content(&state, false, 100, 30);
+        assert!(content.contains(" x3"), "repeated events must show xN");
+        // A single (non-repeated) event shows no suffix.
+        let mut one = connected_slots(|_| {});
+        one.events.clear();
+        one.events.push(EventSeverity::Info, EventKind::Connected, "Connected");
+        one.handle_input(crate::app::event::InputAction::ToggleEvents);
+        let one_content = render_content(&one, false, 100, 30);
+        assert!(!one_content.contains(" x1"));
+    }
+
+    #[test]
+    fn event_panel_empty_shows_no_events() {
+        let mut state = connected_slots(|_| {});
+        state.events.clear();
+        state.handle_input(crate::app::event::InputAction::ToggleEvents);
+        let content = render_content(&state, false, 100, 30);
+        assert!(content.contains("No events yet"));
+    }
+
+    #[test]
+    fn event_scroll_reveals_older_events() {
+        // Five distinct events; the viewport at 100x30 fits ~12 rows, so all
+        // are visible at offset 0. Scrolling up by 4 drops the four newest.
+        let state = {
+            let mut s = connected_slots(|_| {});
+            s.events.clear();
+            for i in 1..=5 {
+                s.events.push(EventSeverity::Info, EventKind::Connected, format!("event {i}"));
+            }
+            s.handle_input(crate::app::event::InputAction::ToggleEvents);
+            s.handle_input(crate::app::event::InputAction::LogEnd);
+            s
+        };
+        let content = render_content(&state, false, 100, 30);
+        // Scrolled to the oldest: only event 1 remains visible; the newest
+        // (event 5) has scrolled off the bottom.
+        assert!(content.contains("event 1"), "the oldest event is visible");
+        assert!(!content.contains("event 5"), "the newest event scrolled away");
+    }
+
+    #[test]
+    fn event_panel_does_not_panic_at_small_sizes() {
+        let state = state_with_events(&[
+            (EventSeverity::Info, EventKind::Connected, "Connected"),
+            (EventSeverity::Error, EventKind::Disconnected, "Connection lost"),
+        ]);
+        // 80x20 keeps the slot table header + rows; the event log takes the
+        // remaining free space (>= 1 row) without a panic.
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("PgUp/PgDn"), "event log still fits at 80x20");
+        // Degenerate sizes fall back without panicking.
+        let _ = render_content(&state, false, 1, 1);
+        let _ = render_content(&state, false, 62, 16);
+    }
+
+    #[test]
+    fn event_panel_ascii_mode_is_ascii_only() {
+        let state = state_with_events(&[
+            (EventSeverity::Info, EventKind::Connected, "Connected"),
+            (EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable"),
+        ]);
+        let ascii = render_content(&state, true, 100, 30);
+        assert!(ascii.contains("PgUp/PgDn"));
+        // No Unicode severity symbols in ASCII mode.
+        assert!(!ascii.contains('○'));
+        assert!(!ascii.contains('▲'));
+        assert!(!ascii.contains('✘'));
     }
 }

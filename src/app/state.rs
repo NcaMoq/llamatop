@@ -8,25 +8,14 @@
 //! Display state (selection, focus, pause, modals) is kept strictly
 //! separate from backend state (the latest snapshot).
 
-use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::app::event::{BackendErrorSummary, InputAction};
 use crate::app::history::History;
+use crate::app::log::{EventKind, EventLog, EventSeverity};
 use crate::backend::BackendCapabilities;
 use crate::config::Config;
-use crate::domain::{BackendSnapshot, ConnectionState, SlotSnapshot};
-
-/// Maximum number of retained log events (bounded, per spec).
-pub const MAX_EVENTS: usize = 200;
-
-/// One retained log line. Messages are plain, redacted text: never prompt,
-/// completion, API key, or authorization header content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppLogEvent {
-    pub at: Instant,
-    pub message: String,
-}
+use crate::domain::{BackendSnapshot, ConnectionState, SlotSnapshot, WorkloadPhase};
 
 /// Panels the focus cycle (Tab / Shift+Tab) moves between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,11 +58,14 @@ pub struct AppState {
     pub authentication_failed: bool,
 
     // --- bounded logs ---
-    pub events: VecDeque<AppLogEvent>,
+    pub events: EventLog,
     pub history: History,
 
     // --- display state ---
     pub selected_slot: usize,
+    /// Event log scroll distance from the NEWEST event (0 = showing the
+    /// latest; larger = scrolled toward older events).
+    pub event_scroll: usize,
     /// Current slot table scroll offset (rows hidden above the viewport).
     /// The renderer derives the exact offset each frame; this value keeps
     /// the position stable while the selection stays inside the viewport.
@@ -92,6 +84,7 @@ pub struct AppState {
     reconnect_requested: bool,
     previous_connection: Option<ConnectionState>,
     previous_server_start: Option<u64>,
+    previous_workload_phase: Option<WorkloadPhase>,
 }
 
 impl AppState {
@@ -104,9 +97,10 @@ impl AppState {
             capabilities: BackendCapabilities::default(),
             connection_message: None,
             authentication_failed: false,
-            events: VecDeque::with_capacity(MAX_EVENTS),
+            events: EventLog::default(),
             history,
             selected_slot: 0,
+            event_scroll: 0,
             slot_scroll: 0,
             slot_detail_open: false,
             focused_panel: FocusedPanel::default(),
@@ -120,6 +114,7 @@ impl AppState {
             reconnect_requested: false,
             previous_connection: None,
             previous_server_start: None,
+            previous_workload_phase: None,
         }
     }
 
@@ -237,11 +232,22 @@ impl AppState {
         std::mem::take(&mut self.reconnect_requested)
     }
 
-    pub fn log(&mut self, message: impl Into<String>) {
-        self.events.push_back(AppLogEvent { at: Instant::now(), message: message.into() });
-        while self.events.len() > MAX_EVENTS {
-            self.events.pop_front();
+    /// Record a redacted state-transition or user-action event. Never pass
+    /// prompt, completion, API key, or raw response body content.
+    pub fn log(&mut self, severity: EventSeverity, kind: EventKind, message: impl Into<String>) {
+        self.events.push(severity, kind, message);
+    }
+
+    /// Scroll the event log by `lines` events toward older events (positive)
+    /// or newer events (negative), clamped to the log length. Only applies
+    /// while the event log is visible.
+    fn scroll_events(&mut self, delta: isize) {
+        if !self.show_events {
+            return;
         }
+        let max = self.events.len().saturating_sub(1);
+        let cur = self.event_scroll.min(max);
+        self.event_scroll = (cur as isize + delta).clamp(0, max as isize) as usize;
     }
 
     /// Handle a render tick: keeps the state current without data changes
@@ -265,7 +271,11 @@ impl AppState {
             InputAction::Quit => self.should_quit = true,
             InputAction::Reconnect => {
                 self.reconnect_requested = true;
-                self.log("Manual reconnect requested");
+                self.log(
+                    EventSeverity::Info,
+                    EventKind::ManualReconnect,
+                    "Manual reconnect requested",
+                );
             }
             InputAction::TogglePause => self.toggle_pause(),
             InputAction::ToggleHelp => self.show_help = !self.show_help,
@@ -276,6 +286,7 @@ impl AppState {
                     self.slot_detail_open = false;
                 } else if self.show_events {
                     self.show_events = false;
+                    self.event_scroll = 0;
                 }
             }
             InputAction::FocusNext => self.focused_panel = self.focused_panel.next(),
@@ -291,10 +302,39 @@ impl AppState {
                 }
             }
             InputAction::ToggleSlotDetail => self.slot_detail_open = !self.slot_detail_open,
-            InputAction::ToggleEvents => self.show_events = !self.show_events,
+            InputAction::ToggleEvents => {
+                self.show_events = !self.show_events;
+                if self.show_events {
+                    self.focused_panel = FocusedPanel::Events;
+                    self.event_scroll = 0;
+                }
+            }
+            // `c` clears whatever the user is looking at: the event log when
+            // it is visible, otherwise the history series.
             InputAction::ClearHistory => {
-                self.history.clear();
-                self.log("History cleared");
+                if self.show_events {
+                    self.events.clear();
+                    self.event_scroll = 0;
+                    self.log(EventSeverity::Info, EventKind::EventLogCleared, "Event log cleared");
+                } else {
+                    self.history.clear();
+                    self.log(EventSeverity::Info, EventKind::HistoryCleared, "History cleared");
+                }
+            }
+            // Event log scrolling only applies while the log is visible; the
+            // state gates it so slot Up/Down (k/j) are never affected.
+            // Home = newest (offset 0), End = oldest (offset = len - 1).
+            InputAction::LogPageUp => self.scroll_events(10),
+            InputAction::LogPageDown => self.scroll_events(-10),
+            InputAction::LogHome => {
+                if self.show_events {
+                    self.event_scroll = 0;
+                }
+            }
+            InputAction::LogEnd => {
+                if self.show_events {
+                    self.event_scroll = self.events.len().saturating_sub(1);
+                }
             }
         }
     }
@@ -310,16 +350,20 @@ impl AppState {
             }
             self.paused = false;
             self.frozen_snapshot = None;
-            self.log("Resume: showing latest snapshot");
+            self.log(
+                EventSeverity::Info,
+                EventKind::PauseChanged,
+                "Resume: showing latest snapshot",
+            );
         } else if self.latest.is_none() {
             // No snapshot to freeze yet: ignoring the request keeps the
             // "Waiting for data..." view from sticking after the first
             // snapshot arrives.
-            self.log("Pause ignored: no data yet");
+            self.log(EventSeverity::Info, EventKind::PauseChanged, "Pause ignored: no data yet");
         } else {
             self.paused = true;
             self.frozen_snapshot = self.latest.clone();
-            self.log("Paused: display frozen");
+            self.log(EventSeverity::Info, EventKind::PauseChanged, "Paused: display frozen");
         }
     }
 
@@ -329,10 +373,21 @@ impl AppState {
         if let Some(prev) = self.previous_connection {
             if prev != snap.connection {
                 match snap.connection {
-                    ConnectionState::Connected => self.log("Connected"),
-                    ConnectionState::Reconnecting => self.log("Reconnecting"),
-                    ConnectionState::Disconnected => self.log("Connection lost"),
-                    _ => self.log(format!("Connection: {}", snap.connection.as_str())),
+                    ConnectionState::Connected => {
+                        self.log(EventSeverity::Info, EventKind::Connected, "Connected")
+                    }
+                    ConnectionState::Connecting => {
+                        self.log(EventSeverity::Info, EventKind::Connecting, "Connecting")
+                    }
+                    ConnectionState::Reconnecting => {
+                        self.log(EventSeverity::Warning, EventKind::Reconnecting, "Reconnecting")
+                    }
+                    ConnectionState::Disconnected => {
+                        self.log(EventSeverity::Error, EventKind::Disconnected, "Connection lost")
+                    }
+                    ConnectionState::Error => {
+                        self.log(EventSeverity::Error, EventKind::Disconnected, "Connection lost")
+                    }
                 }
             }
         }
@@ -348,19 +403,46 @@ impl AppState {
             let changed = self.latest.as_ref().map(|l| l.server != snap.server).unwrap_or(true);
             if changed {
                 match snap.server {
-                    crate::domain::ServerState::Ready => self.log("Server ready"),
-                    crate::domain::ServerState::Loading => self.log("Server loading"),
-                    crate::domain::ServerState::Sleeping => self.log("Server sleeping"),
+                    crate::domain::ServerState::Ready => {
+                        self.log(EventSeverity::Info, EventKind::ServerStateChanged, "Server ready")
+                    }
+                    crate::domain::ServerState::Loading => self.log(
+                        EventSeverity::Info,
+                        EventKind::ServerStateChanged,
+                        "Server loading",
+                    ),
+                    crate::domain::ServerState::Sleeping => self.log(
+                        EventSeverity::Info,
+                        EventKind::ServerStateChanged,
+                        "Server sleeping",
+                    ),
                     _ => {}
                 }
             }
+
+            // Workload phase transitions are worth a log line (only on a
+            // change, so a steady DECODE phase does not fill the log).
+            if let Some(prev) = self.previous_workload_phase {
+                if prev != snap.workload_phase {
+                    self.log(
+                        EventSeverity::Info,
+                        EventKind::WorkloadPhaseChanged,
+                        format!("Phase: {} -> {}", prev.display(), snap.workload_phase.display()),
+                    );
+                }
+            }
+            self.previous_workload_phase = Some(snap.workload_phase);
 
             // Server restart: invalidate history so no invalid delta spike
             // is plotted.
             if let Some(start) = snap.server_start_unix {
                 if self.previous_server_start.is_some() && self.previous_server_start != Some(start)
                 {
-                    self.log("Server restart detected");
+                    self.log(
+                        EventSeverity::Warning,
+                        EventKind::ServerStateChanged,
+                        "Server restart detected",
+                    );
                     self.history.clear();
                 }
                 self.previous_server_start = Some(start);
@@ -393,13 +475,13 @@ impl AppState {
     /// Apply a capabilities update.
     pub fn apply_capabilities(&mut self, caps: BackendCapabilities) {
         if caps != self.capabilities {
-            self.log("Capabilities changed");
+            self.log(EventSeverity::Info, EventKind::MetricsUnavailable, "Capabilities changed");
         }
         if !caps.metrics {
-            self.log("Metrics unavailable");
+            self.log(EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable");
         }
         if !caps.slots {
-            self.log("Slots unavailable");
+            self.log(EventSeverity::Warning, EventKind::SlotsUnavailable, "Slots unavailable");
         }
         self.capabilities = caps;
     }
@@ -411,7 +493,15 @@ impl AppState {
     /// stale auth-failure state (and vice versa).
     pub fn apply_error(&mut self, err: BackendErrorSummary) {
         self.authentication_failed = is_authentication_error(&err.message);
-        self.connection_message = Some(err.message);
+        self.connection_message = Some(err.message.clone());
+        let severity =
+            if self.authentication_failed { EventSeverity::Error } else { EventSeverity::Warning };
+        let kind = if self.authentication_failed {
+            EventKind::AuthenticationFailed
+        } else {
+            EventKind::Disconnected
+        };
+        self.log(severity, kind, err.message);
     }
 }
 
@@ -581,11 +671,154 @@ mod tests {
     fn events_remain_bounded() {
         let mut s = AppState::new(&config());
         for i in 0..1000 {
-            s.log(format!("event {i}"));
+            s.log(EventSeverity::Info, EventKind::Connected, format!("event {i}"));
         }
-        assert!(s.events.len() <= MAX_EVENTS);
+        assert!(s.events.len() <= crate::app::log::MAX_LOG_EVENTS);
         // The most recent event is retained.
-        assert_eq!(s.events.back().unwrap().message, "event 999");
+        assert_eq!(s.events.records().back().unwrap().message, "event 999");
+    }
+
+    #[test]
+    fn connection_transitions_create_one_event_each() {
+        let mut s = AppState::new(&config());
+        // The first observation sets the baseline: no event yet.
+        s.apply_snapshot(snapshot(ConnectionState::Connecting, None));
+        s.apply_snapshot(snapshot(ConnectionState::Connected, None));
+        s.apply_snapshot(snapshot(ConnectionState::Disconnected, None));
+        // One event per transition (not per snapshot, none for the first
+        // observation).
+        let records = s.events.records();
+        let kinds: Vec<EventKind> = records.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![EventKind::Connected, EventKind::Disconnected]);
+        // A steady state does not add a duplicate event.
+        s.apply_snapshot(snapshot(ConnectionState::Disconnected, None));
+        assert_eq!(s.events.len(), 2);
+    }
+
+    #[test]
+    fn repeated_identical_error_collapses_repeat_count() {
+        let mut s = AppState::new(&config());
+        for _ in 0..5 {
+            s.apply_error(BackendErrorSummary::new("cannot connect: connection refused"));
+        }
+        // Identical repeated errors collapse into one record.
+        assert_eq!(s.events.len(), 1);
+        let rec = s.events.records().back().unwrap();
+        assert_eq!(rec.repeat_count, 5);
+        assert_eq!(rec.kind, EventKind::Disconnected);
+    }
+
+    #[test]
+    fn workload_phase_change_creates_event() {
+        let mut s = AppState::new(&config());
+        let mut decode = snapshot(ConnectionState::Connected, None);
+        decode.workload_phase = crate::domain::WorkloadPhase::Decode;
+        s.apply_snapshot(decode);
+        let mut idle = snapshot(ConnectionState::Connected, None);
+        idle.workload_phase = crate::domain::WorkloadPhase::Idle;
+        s.apply_snapshot(idle);
+        let rec = s
+            .events
+            .records()
+            .iter()
+            .find(|r| r.kind == EventKind::WorkloadPhaseChanged)
+            .expect("a phase-change event exists");
+        assert!(rec.message.contains("DECODE"));
+        assert!(rec.message.contains("IDLE"));
+    }
+
+    #[test]
+    fn steady_workload_phase_does_not_spam_events() {
+        let mut s = AppState::new(&config());
+        let mut decode = snapshot(ConnectionState::Connected, None);
+        decode.workload_phase = crate::domain::WorkloadPhase::Decode;
+        for _ in 0..10 {
+            s.apply_snapshot(snapshot(ConnectionState::Connected, None));
+        }
+        let phase_events =
+            s.events.records().iter().filter(|r| r.kind == EventKind::WorkloadPhaseChanged).count();
+        assert_eq!(phase_events, 0, "a steady phase must not log repeatedly");
+    }
+
+    #[test]
+    fn manual_reconnect_logs_an_event() {
+        let mut s = AppState::new(&config());
+        s.handle_input(InputAction::Reconnect);
+        let rec = s.events.records().back().unwrap();
+        assert_eq!(rec.kind, EventKind::ManualReconnect);
+        assert_eq!(rec.severity, EventSeverity::Info);
+    }
+
+    #[test]
+    fn pause_and_resume_log_events() {
+        let mut s = AppState::new(&config());
+        s.apply_snapshot(snapshot(ConnectionState::Connected, None));
+        s.handle_input(InputAction::TogglePause);
+        assert_eq!(s.events.records().back().unwrap().kind, EventKind::PauseChanged);
+        s.handle_input(InputAction::TogglePause);
+        let rec = s.events.records().back().unwrap();
+        assert_eq!(rec.kind, EventKind::PauseChanged);
+        assert_eq!(rec.message, "Resume: showing latest snapshot");
+    }
+
+    #[test]
+    fn event_log_clear_only_when_events_visible() {
+        let mut s = AppState::new(&config());
+        s.apply_snapshot(snapshot(ConnectionState::Connected, None));
+        // With events hidden, `c` clears the history instead (no event-log
+        // clear event is recorded).
+        s.handle_input(InputAction::ClearHistory);
+        assert!(s.history.is_empty());
+        assert!(
+            s.events.records().iter().all(|r| r.kind != EventKind::EventLogCleared),
+            "history clear must not log an event-log clear"
+        );
+
+        // With events visible, `c` clears the event log and logs the clear.
+        s.handle_input(InputAction::ToggleEvents);
+        assert!(s.show_events);
+        s.handle_input(InputAction::ClearHistory);
+        let rec = s.events.records().back().unwrap();
+        assert_eq!(rec.kind, EventKind::EventLogCleared);
+    }
+
+    #[test]
+    fn event_scroll_is_gated_to_visible_events() {
+        let mut s = AppState::new(&config());
+        // Distinct messages so nothing collapses.
+        for i in 0..20 {
+            s.log(EventSeverity::Info, EventKind::Connected, format!("e{i}"));
+        }
+        // Not visible: scrolling is a no-op.
+        s.handle_input(InputAction::LogPageUp);
+        s.handle_input(InputAction::LogEnd);
+        assert_eq!(s.event_scroll, 0, "scroll must be inert while events are hidden");
+
+        // Visible: scrolling works and is clamped. PageUp moves toward the
+        // older events (larger offset from the newest).
+        s.handle_input(InputAction::ToggleEvents);
+        s.handle_input(InputAction::LogEnd);
+        assert_eq!(s.event_scroll, 19);
+        s.handle_input(InputAction::LogPageUp);
+        assert_eq!(s.event_scroll, 19, "clamped at the oldest event");
+        s.handle_input(InputAction::LogPageDown);
+        assert_eq!(s.event_scroll, 9);
+        s.handle_input(InputAction::LogHome);
+        assert_eq!(s.event_scroll, 0);
+        s.handle_input(InputAction::LogPageDown);
+        assert_eq!(s.event_scroll, 0, "clamped at the newest event");
+    }
+
+    #[test]
+    fn slot_navigation_unaffected_by_log_scroll_keys() {
+        let mut s = state_with_slots(&[0, 1, 2]);
+        // Log-scroll keys must not move the slot selection.
+        s.handle_input(InputAction::LogPageUp);
+        s.handle_input(InputAction::LogPageDown);
+        assert_eq!(s.selected_slot, 0);
+        // Normal slot navigation still works.
+        s.handle_input(InputAction::SlotDown);
+        assert_eq!(s.selected_slot, 1);
     }
 
     #[test]

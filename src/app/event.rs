@@ -57,8 +57,17 @@ pub enum InputAction {
     ToggleSlotDetail,
     /// `l` — toggle the event log panel
     ToggleEvents,
-    /// `c` — clear the history
+    /// `c` — clear the event log (when the event log is visible) or the
+    /// history (otherwise)
     ClearHistory,
+    /// `PageUp` — scroll the event log toward older events
+    LogPageUp,
+    /// `PageDown` — scroll the event log toward newer events
+    LogPageDown,
+    /// `Home` — jump to the newest events
+    LogHome,
+    /// `End` — jump to the oldest events
+    LogEnd,
 }
 
 /// Commands the application sends to the backend collector.

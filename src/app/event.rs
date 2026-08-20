@@ -11,7 +11,7 @@
 //! collector never writes into the state directly.
 
 use crate::backend::BackendCapabilities;
-use crate::domain::{BackendSnapshot, SystemSnapshot};
+use crate::domain::{BackendSnapshot, GpuMonitor, SystemSnapshot};
 
 /// Events flowing into the application task.
 #[derive(Debug)]
@@ -32,6 +32,8 @@ pub enum AppEvent {
     SystemSample(SystemSnapshot),
     /// The system monitor became unavailable (Phase D).
     SystemUnavailable,
+    /// A GPU monitor sampling pass (Phase E): status plus per-GPU snapshots.
+    GpuSample(GpuMonitor),
 }
 
 /// Keyboard actions understood by the application. The mapping from raw key

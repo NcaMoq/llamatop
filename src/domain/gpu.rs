@@ -2,6 +2,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The monitoring state of the GPU subsystem.
+///
+/// `Disabled` means the monitor was not started (config). The failure
+/// states are sticky per process run: a failed NVML initialization is not
+/// retried because the driver will not appear while the process is alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuMonitorStatus {
+    #[default]
+    Disabled,
+    Available,
+    Unavailable,
+    InitializationFailed,
+    SamplingFailed,
+}
+
+/// One sampling pass of the GPU monitor: a status plus the per-GPU
+/// snapshots (empty for every non-available status).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuMonitor {
+    pub status: GpuMonitorStatus,
+    pub gpus: Vec<GpuSnapshot>,
+}
+
 /// A snapshot of one GPU. Every field is optional: a provider may fail to
 /// read some values without failing the whole snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

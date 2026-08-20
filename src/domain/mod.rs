@@ -12,7 +12,7 @@ pub mod snapshot;
 pub mod system;
 
 pub use connection::ConnectionState;
-pub use gpu::GpuSnapshot;
+pub use gpu::{GpuMonitor, GpuMonitorStatus, GpuSnapshot};
 pub use inference::{Confidence, WorkloadPhase};
 pub use server::ServerState;
 pub use slot::{SlotPhase, SlotSnapshot};

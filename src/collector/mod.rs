@@ -5,4 +5,5 @@
 //! share mutable state with it.
 
 pub mod backend;
+pub mod gpu;
 pub mod system;

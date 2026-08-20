@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::app::event::{AppEvent, CollectorCommand};
 use crate::app::state::AppState;
 use crate::collector::backend;
+use crate::collector::gpu as gpu_monitor;
 use crate::collector::system as system_monitor;
 use crate::config::Config;
 
@@ -53,15 +54,36 @@ pub async fn run(
         None
     };
 
+    // The optional NVML GPU monitor (Phase E). NVML absence must not break
+    // startup: the provider records the init failure and samples it as an
+    // unavailable monitor. Disabled by config.
+    let gpu_monitor = if config.show_gpu {
+        let required = config.gpu.backend == "nvml";
+        let provider = gpu_monitor::shared(gpu_monitor::NvmlProvider::new(
+            required,
+            config.gpu.device_indices.clone(),
+        ));
+        Some(gpu_monitor::start(provider, events_tx.clone(), gpu_monitor::GPU_SAMPLE_INTERVAL))
+    } else {
+        None
+    };
+
     let (commands_tx, commands_rx) = unbounded_channel::<CollectorCommand>();
     let collector = tokio::spawn(backend::run(config, events_tx, commands_rx));
 
     let run_result = run_event_loop(&mut state, &mut events_rx, &commands_tx, &mut draw).await;
 
     // Mandatory cleanup, independent of how the loop ended: stop and join
-    // both the monitor and the collector so no detached task survives, even
+    // both monitors and the collector so no detached task survives, even
     // after a draw/command failure.
-    let monitor_joined = match system_monitor {
+    let system_joined = match system_monitor {
+        Some((stop_tx, handle)) => {
+            let _ = stop_tx.send(());
+            handle.await
+        }
+        None => Ok(()),
+    };
+    let gpu_joined = match gpu_monitor {
         Some((stop_tx, handle)) => {
             let _ = stop_tx.send(());
             handle.await
@@ -71,7 +93,7 @@ pub async fn run(
     let _ = commands_tx.send(CollectorCommand::Stop);
     let joined = collector.await;
 
-    finish_run(run_result, joined, monitor_joined)
+    finish_run(run_result, joined, system_joined, gpu_joined)
 }
 
 /// Combine the event-loop result with the collector and monitor joins.
@@ -82,20 +104,30 @@ pub async fn run(
 fn finish_run(
     run_result: anyhow::Result<i32>,
     joined: Result<(), tokio::task::JoinError>,
-    monitor_joined: Result<(), tokio::task::JoinError>,
+    system_joined: Result<(), tokio::task::JoinError>,
+    gpu_joined: Result<(), tokio::task::JoinError>,
 ) -> anyhow::Result<i32> {
-    match (run_result, joined, monitor_joined) {
-        (Ok(code), Ok(()), Ok(())) => Ok(code),
-        (Ok(_), Err(err), Ok(())) => {
+    match (run_result, joined, system_joined, gpu_joined) {
+        (Ok(code), Ok(()), Ok(()), Ok(())) => Ok(code),
+        (Ok(_), Err(err), Ok(()), Ok(())) => {
             Err(anyhow::anyhow!("collector task failed during shutdown: {err}"))
         }
-        (Ok(_), Ok(()), Err(err)) => {
+        (Ok(_), Ok(()), Err(err), Ok(())) => {
             Err(anyhow::anyhow!("system monitor failed during shutdown: {err}"))
         }
-        (Ok(_), Err(err), Err(_)) => {
+        (Ok(_), Ok(()), Ok(()), Err(err)) => {
+            Err(anyhow::anyhow!("gpu monitor failed during shutdown: {err}"))
+        }
+        (Ok(_), Err(err), Err(_), Ok(())) | (Ok(_), Err(err), Ok(()), Err(_)) => {
             Err(anyhow::anyhow!("collector task failed during shutdown: {err}"))
         }
-        (Err(err), _, _) => Err(err),
+        (Ok(_), Ok(()), Err(sys_err), Err(gpu_err)) => Err(anyhow::anyhow!(
+            "system monitor failed during shutdown: {sys_err}; gpu monitor failed: {gpu_err}"
+        )),
+        (Ok(_), Err(err), Err(sys_err), Err(gpu_err)) => Err(anyhow::anyhow!(
+            "collector task failed during shutdown: {err}; system monitor: {sys_err}; gpu monitor: {gpu_err}"
+        )),
+        (Err(err), _, _, _) => Err(err),
     }
 }
 
@@ -152,6 +184,7 @@ fn handle(state: &mut AppState, event: AppEvent) {
         AppEvent::Resize(width, height) => state.terminal_size = (width, height),
         AppEvent::SystemSample(snap) => state.apply_system(snap),
         AppEvent::SystemUnavailable => state.apply_system_unavailable(),
+        AppEvent::GpuSample(monitor) => state.apply_gpu(monitor),
     }
 }
 
@@ -212,21 +245,28 @@ mod tests {
 
     #[test]
     fn finish_run_returns_clean_exit_on_success() {
-        assert_eq!(finish_run(Ok(0), Ok(()), Ok(())).expect("clean exit"), 0);
+        assert_eq!(finish_run(Ok(0), Ok(()), Ok(()), Ok(())).expect("clean exit"), 0);
     }
 
     #[tokio::test]
     async fn finish_run_reports_collector_panic_on_clean_exit() {
-        let err = finish_run(Ok(0), Err(panicking_join_error().await), Ok(()))
+        let err = finish_run(Ok(0), Err(panicking_join_error().await), Ok(()), Ok(()))
             .expect_err("a collector panic must not be silently ignored");
         assert!(err.to_string().contains("collector task failed"));
     }
 
     #[tokio::test]
-    async fn finish_run_reports_monitor_panic_on_clean_exit() {
-        let err = finish_run(Ok(0), Ok(()), Err(panicking_join_error().await))
+    async fn finish_run_reports_system_monitor_panic_on_clean_exit() {
+        let err = finish_run(Ok(0), Ok(()), Err(panicking_join_error().await), Ok(()))
             .expect_err("a monitor panic must not be silently ignored");
         assert!(err.to_string().contains("system monitor failed"));
+    }
+
+    #[tokio::test]
+    async fn finish_run_reports_gpu_monitor_panic_on_clean_exit() {
+        let err = finish_run(Ok(0), Ok(()), Ok(()), Err(panicking_join_error().await))
+            .expect_err("a monitor panic must not be silently ignored");
+        assert!(err.to_string().contains("gpu monitor failed"));
     }
 
     #[tokio::test]
@@ -234,6 +274,7 @@ mod tests {
         let loop_err = anyhow::anyhow!("draw failed");
         let err = finish_run(
             Err(loop_err),
+            Err(panicking_join_error().await),
             Err(panicking_join_error().await),
             Err(panicking_join_error().await),
         )
@@ -247,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn finish_run_keeps_loop_error_over_clean_join() {
         let loop_err = anyhow::anyhow!("draw failed");
-        let err = finish_run(Err(loop_err), Ok(()), Ok(())).expect_err("has error");
+        let err = finish_run(Err(loop_err), Ok(()), Ok(()), Ok(())).expect_err("has error");
         assert!(err.to_string().contains("draw failed"));
     }
 
@@ -273,6 +314,15 @@ mod tests {
 
         handle(&mut state, AppEvent::Input(InputAction::ToggleHelp));
         assert!(state.show_help);
+
+        handle(
+            &mut state,
+            AppEvent::GpuSample(crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::Unavailable,
+                gpus: Vec::new(),
+            }),
+        );
+        assert!(state.gpu.is_some());
 
         handle(&mut state, AppEvent::Tick);
     }

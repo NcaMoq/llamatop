@@ -16,7 +16,8 @@ use crate::app::log::{EventKind, EventLog, EventSeverity};
 use crate::backend::BackendCapabilities;
 use crate::config::Config;
 use crate::domain::{
-    BackendSnapshot, ConnectionState, SlotSnapshot, SystemSnapshot, WorkloadPhase,
+    BackendSnapshot, ConnectionState, GpuMonitor, GpuMonitorStatus, SlotSnapshot, SystemSnapshot,
+    WorkloadPhase,
 };
 
 /// Panels the focus cycle (Tab / Shift+Tab) moves between.
@@ -59,12 +60,18 @@ pub struct AppState {
     /// Latest host + llama-server process sample (Phase D). `None` until the
     /// system monitor has produced a sample or when it is disabled.
     pub system: Option<SystemSnapshot>,
+    /// Latest GPU monitor pass (Phase E): status plus per-GPU snapshots.
+    /// `None` until the first pass arrives or when GPU monitoring is
+    /// disabled.
+    pub gpu: Option<GpuMonitor>,
     pub connection_message: Option<String>,
     /// Set while the last reported backend error was an authentication
     /// failure (the view then offers the env-var hint instead of a retry).
     pub authentication_failed: bool,
     /// Whether the Resources panel (host + process) is shown (config).
     pub show_system: bool,
+    /// Whether the Resources panel shows a GPU section (config).
+    pub show_gpu: bool,
 
     // --- bounded logs ---
     pub events: EventLog,
@@ -105,9 +112,11 @@ impl AppState {
             latest: None,
             capabilities: BackendCapabilities::default(),
             system: None,
+            gpu: None,
             connection_message: None,
             authentication_failed: false,
             show_system: config.show_system,
+            show_gpu: config.show_gpu,
             events: EventLog::default(),
             history,
             selected_slot: 0,
@@ -532,6 +541,59 @@ impl AppState {
         }
         self.system = None;
     }
+
+    /// Apply a GPU monitor sampling pass (Phase E). A status change is
+    /// logged once (steady states do not spam the log); a pass that has
+    /// `Available` status replaces the stored pass, a failure pass keeps
+    /// the last known-good data visible but records the failure status.
+    pub fn apply_gpu(&mut self, monitor: GpuMonitor) {
+        let prev = self.gpu.as_ref().map(|m| m.status);
+        if prev != Some(monitor.status) {
+            match monitor.status {
+                GpuMonitorStatus::Available => {
+                    let count = monitor.gpus.len();
+                    self.log(
+                        EventSeverity::Info,
+                        EventKind::ServerStateChanged,
+                        format!("GPU monitoring available ({count} device(s))"),
+                    );
+                }
+                GpuMonitorStatus::Unavailable => {
+                    self.log(
+                        EventSeverity::Warning,
+                        EventKind::GpuMonitorUnavailable,
+                        "GPU monitoring unavailable",
+                    );
+                }
+                GpuMonitorStatus::InitializationFailed => {
+                    self.log(
+                        EventSeverity::Warning,
+                        EventKind::GpuMonitorUnavailable,
+                        "GPU initialization failed (NVML)",
+                    );
+                }
+                GpuMonitorStatus::SamplingFailed => {
+                    self.log(
+                        EventSeverity::Warning,
+                        EventKind::GpuMonitorUnavailable,
+                        "GPU sampling failed",
+                    );
+                }
+                GpuMonitorStatus::Disabled => {}
+            }
+        }
+        // A failure pass keeps the last good data on screen (the status
+        // note explains it); an available pass replaces it.
+        match (monitor.status, monitor.gpus.is_empty()) {
+            (GpuMonitorStatus::Available, false) => self.gpu = Some(monitor),
+            _ if self.gpu.is_none() => self.gpu = Some(monitor),
+            _ => {
+                if let Some(stored) = self.gpu.as_mut() {
+                    stored.status = monitor.status;
+                }
+            }
+        }
+    }
 }
 
 /// True when an error message is the authentication failure produced by
@@ -889,6 +951,79 @@ mod tests {
                 .count(),
             1,
             "the unavailable warning must not repeat"
+        );
+    }
+
+    /// A GPU monitor pass with the given status and device count.
+    fn gpu_monitor(status: GpuMonitorStatus, count: usize) -> GpuMonitor {
+        GpuMonitor {
+            status,
+            gpus: (0..count)
+                .map(|i| crate::domain::GpuSnapshot {
+                    index: i as u32,
+                    uuid: Some(format!("GPU-{i}")),
+                    name: Some(format!("GPU {i}")),
+                    utilization_percent: Some(10),
+                    memory_used_bytes: Some(1),
+                    memory_total_bytes: Some(2),
+                    temperature_celsius: None,
+                    power_watts: None,
+                    power_limit_watts: None,
+                    graphics_clock_mhz: None,
+                    memory_clock_mhz: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn gpu_sample_available_stores_gpus() {
+        let mut s = AppState::new(&config());
+        s.apply_gpu(gpu_monitor(GpuMonitorStatus::Available, 2));
+        assert_eq!(s.gpu.as_ref().unwrap().status, GpuMonitorStatus::Available);
+        assert_eq!(s.gpu.as_ref().unwrap().gpus.len(), 2);
+        // A steady available pass does not log again.
+        s.apply_gpu(gpu_monitor(GpuMonitorStatus::Available, 2));
+        assert_eq!(
+            s.events.records().iter().filter(|r| r.kind == EventKind::ServerStateChanged).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn gpu_failure_keeps_last_good_data_and_logs_once() {
+        let mut s = AppState::new(&config());
+        s.apply_gpu(gpu_monitor(GpuMonitorStatus::Available, 1));
+        s.apply_gpu(gpu_monitor(GpuMonitorStatus::SamplingFailed, 0));
+        // The failure status is recorded, but the last good device list
+        // stays on screen.
+        assert_eq!(s.gpu.as_ref().unwrap().status, GpuMonitorStatus::SamplingFailed);
+        assert_eq!(s.gpu.as_ref().unwrap().gpus.len(), 1);
+        s.apply_gpu(gpu_monitor(GpuMonitorStatus::SamplingFailed, 0));
+        assert_eq!(
+            s.events
+                .records()
+                .iter()
+                .filter(|r| r.kind == EventKind::GpuMonitorUnavailable)
+                .count(),
+            1,
+            "a steady failure must not spam the log"
+        );
+    }
+
+    #[test]
+    fn gpu_unavailable_before_any_data_logs_one_warning() {
+        let mut s = AppState::new(&config());
+        s.apply_gpu(gpu_monitor(GpuMonitorStatus::Unavailable, 0));
+        assert!(s.gpu.is_some());
+        assert_eq!(s.gpu.as_ref().unwrap().gpus.len(), 0);
+        assert_eq!(
+            s.events
+                .records()
+                .iter()
+                .filter(|r| r.kind == EventKind::GpuMonitorUnavailable)
+                .count(),
+            1
         );
     }
 

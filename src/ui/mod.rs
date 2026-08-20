@@ -1054,6 +1054,7 @@ mod tests {
     fn resources_panel_hidden_when_disabled() {
         let mut state = connected_slots(|_| {});
         state.show_system = false;
+        state.show_gpu = false;
         state.system = Some(crate::domain::SystemSnapshot {
             cpu_usage_percent: Some(5.0),
             ram_used_bytes: None,
@@ -1104,5 +1105,144 @@ mod tests {
         let _ = render_content(&state, false, 80, 20);
         let _ = render_content(&state, false, 1, 1);
         let _ = render_content(&state, false, 62, 16);
+    }
+
+    /// A full GPU snapshot with the given index and name.
+    fn gpu(index: u32, name: &str) -> crate::domain::GpuSnapshot {
+        crate::domain::GpuSnapshot {
+            index,
+            uuid: Some(format!("GPU-uuid-{index}")),
+            name: Some(name.to_string()),
+            utilization_percent: Some(42),
+            memory_used_bytes: Some(1 << 30),
+            memory_total_bytes: Some(1 << 34),
+            temperature_celsius: Some(55),
+            power_watts: Some(120.0),
+            power_limit_watts: Some(350.0),
+            graphics_clock_mhz: Some(2500),
+            memory_clock_mhz: Some(8000),
+        }
+    }
+
+    /// Connected/slots state with a controlled host sample + GPU monitor.
+    fn state_with_gpu(
+        sys: crate::domain::SystemSnapshot,
+        gpu: crate::domain::GpuMonitor,
+    ) -> AppState {
+        let mut state = connected_slots(|_| {});
+        state.show_system = true;
+        state.show_gpu = true;
+        state.system = Some(sys);
+        state.gpu = Some(gpu);
+        state
+    }
+
+    fn host_sample() -> crate::domain::SystemSnapshot {
+        crate::domain::SystemSnapshot {
+            cpu_usage_percent: Some(10.0),
+            ram_used_bytes: Some(10_000),
+            ram_total_bytes: Some(20_000),
+            process_match_count: Some(0),
+            process: None,
+        }
+    }
+
+    #[test]
+    fn gpu_section_renders_a_row_per_device() {
+        let state = state_with_gpu(
+            host_sample(),
+            crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::Available,
+                gpus: vec![gpu(0, "NVIDIA RTX 5090"), gpu(1, "NVIDIA RTX 4090")],
+            },
+        );
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("NVIDIA RTX 5090"), "first GPU named");
+        assert!(content.contains("NVIDIA RTX 4090"), "second GPU named");
+        assert!(content.contains("42%"), "utilization shown");
+        assert!(content.contains("1.0G/16.0G"), "VRAM used/total compact");
+        assert!(content.contains("55C"), "temperature shown");
+        assert!(content.contains("120/350W"), "power/limit shown");
+        // The GPU rows must never claim the device belongs to llama-server.
+        assert!(!content.contains("llama-server GPU"));
+        assert!(!content.contains("server GPU"));
+    }
+
+    #[test]
+    fn gpu_section_unavailable_note() {
+        let state = state_with_gpu(
+            host_sample(),
+            crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::Unavailable,
+                gpus: Vec::new(),
+            },
+        );
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("GPU monitoring unavailable"));
+    }
+
+    #[test]
+    fn gpu_section_initialization_failed_note() {
+        let state = state_with_gpu(
+            host_sample(),
+            crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::InitializationFailed,
+                gpus: Vec::new(),
+            },
+        );
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("failed to initialize (NVML)"));
+    }
+
+    #[test]
+    fn gpu_section_sampling_failed_note() {
+        let state = state_with_gpu(
+            host_sample(),
+            crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::SamplingFailed,
+                gpus: Vec::new(),
+            },
+        );
+        let content = render_content(&state, false, 100, 40);
+        assert!(content.contains("GPU sampling failed"));
+    }
+
+    #[test]
+    fn gpu_row_missing_values_use_placeholder_not_zero() {
+        let mut g = gpu(0, "NVIDIA RTX 5090");
+        g.utilization_percent = None;
+        g.memory_total_bytes = None;
+        g.temperature_celsius = None;
+        g.power_watts = None;
+        g.name = None;
+        let state = state_with_gpu(
+            host_sample(),
+            crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::Available,
+                gpus: vec![g],
+            },
+        );
+        let content = render_content(&state, false, 100, 40);
+        // The GPU row renders with placeholders for every missing value.
+        // Scoped to the "GPU  0" prefix so the host row ("CPU 10.0%") cannot
+        // satisfy or break the checks.
+        assert!(content.contains("GPU  0   —   —"), "missing values use the placeholder");
+        assert!(!content.contains("GPU  0   0%"), "no fabricated 0% utilization");
+        assert!(!content.contains("GPU  0   0C"), "no fabricated 0C temperature");
+    }
+
+    #[test]
+    fn gpu_section_hidden_when_disabled() {
+        let mut state = state_with_gpu(
+            host_sample(),
+            crate::domain::GpuMonitor {
+                status: crate::domain::GpuMonitorStatus::Available,
+                gpus: vec![gpu(0, "NVIDIA RTX 5090")],
+            },
+        );
+        state.show_gpu = false;
+        let content = render_content(&state, false, 100, 40);
+        assert!(!content.contains("NVIDIA RTX 5090"), "no GPU rows when disabled");
+        assert!(!content.contains("GPU monitoring"), "no GPU status note when disabled");
     }
 }

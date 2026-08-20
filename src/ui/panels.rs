@@ -20,7 +20,8 @@ use crate::app::log::{EventRecord, EventSeverity};
 use crate::app::state::AppState;
 use crate::display::Symbols;
 use crate::domain::{
-    BackendSnapshot, Confidence, ConnectionState, ServerState, SlotSnapshot, SystemSnapshot,
+    BackendSnapshot, Confidence, ConnectionState, GpuMonitorStatus, GpuSnapshot, ServerState,
+    SlotSnapshot, SystemSnapshot,
 };
 
 /// Minimum size at which the full panel layout is rendered.
@@ -97,15 +98,24 @@ pub fn render(f: &mut Frame, state: &AppState, symbols: &Symbols) {
                                 .height
                                 .saturating_sub(6)
                                 .saturating_sub(status_count as u16);
-                            // Resources is a compact 4-row block (2 borders +
-                            // 2 content lines) with the LOWEST layout
-                            // priority. At 80x20 (free=8) and 100x30 (free=18)
-                            // it is hidden so the slot table keeps its full
-                            // rows and the history keeps its full layout; it
-                            // appears only when the terminal is tall enough
-                            // (free >= 19) that the full 9-row history still
-                            // fits alongside it.
-                            let resources_h = if state.show_system && free >= 19 { 4 } else { 0 };
+                            // The Resources panel (host + llama-server
+                            // process + NVIDIA GPUs) has the LOWEST layout
+                            // priority. Its height follows what it shows:
+                            // two host/process lines (when enabled) plus one
+                            // line per GPU (capped) or a status note. It is
+                            // hidden unless the full 9-row history still fits
+                            // beside it (free >= 15 + height), so at 80x20
+                            // (free=8) and 100x30 (free=18) it stays hidden
+                            // and the slot table and history keep their rows.
+                            let resources_h: u16 = {
+                                let content = resources_content_lines(state);
+                                let h = content + 2;
+                                if content > 0 && usize::from(free) >= 15 + h {
+                                    h as u16
+                                } else {
+                                    0
+                                }
+                            };
                             let detail_budget = free.saturating_sub(resources_h);
                             // The remaining space is shared by the detail
                             // panel. History tiers as space allows (block
@@ -466,30 +476,136 @@ fn render_resources(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbo
         return;
     }
 
-    let sys = match &state.system {
-        Some(s) => s,
-        None => {
-            let text = Paragraph::new(vec![
-                Line::from(format!("{} System monitor unavailable", symbols.warning())),
-                Line::from("Host and process metrics are not being sampled."),
-            ]);
-            f.render_widget(text, inner);
-            return;
-        }
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-    // Line 1: host CPU + RAM.
-    let cpu = format_percent_value(sys.cpu_usage_percent, symbols);
-    let ram = ram_display(sys.ram_used_bytes, sys.ram_total_bytes, symbols);
-    lines.push(Line::from(format!("CPU {cpu}   RAM {ram}")));
-
-    // Line 2: the llama-server process, or a candidate-count note.
-    let process_line = process_line(sys, symbols);
-    lines.push(Line::from(process_line));
-
+    let lines = resources_lines(state, inner.width, symbols);
     let text = Paragraph::new(lines);
     f.render_widget(text, inner);
+}
+
+/// All Resources content lines (host/process when enabled, then the GPU
+/// section when enabled). The layout uses the same rule to compute the
+/// panel height, so the two never diverge.
+fn resources_lines<'a>(state: &'a AppState, width: u16, symbols: &'a Symbols) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    if state.show_system {
+        match &state.system {
+            Some(sys) => {
+                // Line 1: host CPU + RAM.
+                let cpu = format_percent_value(sys.cpu_usage_percent, symbols);
+                let ram = ram_display(sys.ram_used_bytes, sys.ram_total_bytes, symbols);
+                lines.push(Line::from(format!("CPU {cpu}   RAM {ram}")));
+                // Line 2: the llama-server process, or a candidate note.
+                lines.push(Line::from(process_line(sys, symbols)));
+            }
+            None => {
+                lines.push(Line::from(format!("{} System monitor unavailable", symbols.warning())));
+                lines.push(Line::from("Host and process metrics are not being sampled."));
+            }
+        }
+    }
+
+    if state.show_gpu {
+        lines.extend(gpu_lines(state, width, symbols));
+    }
+
+    lines
+}
+
+/// Number of Resources content lines (drives the layout height). Mirrors
+/// `resources_lines` exactly: 2 for the host/process block when enabled,
+/// plus the GPU section (0 when disabled).
+fn resources_content_lines(state: &AppState) -> usize {
+    let sys = if state.show_system { 2 } else { 0 };
+    let gpu = if state.show_gpu {
+        match &state.gpu {
+            None => 1, // enabled, first pass not yet delivered
+            Some(m) => match m.status {
+                GpuMonitorStatus::Available => {
+                    let n = m.gpus.len();
+                    n.min(MAX_GPU_LINES) + usize::from(n > MAX_GPU_LINES)
+                }
+                _ => 1, // a single status note
+            },
+        }
+    } else {
+        0
+    };
+    if sys + gpu == 0 {
+        0
+    } else {
+        sys + gpu
+    }
+}
+
+/// Maximum per-GPU rows in the Resources panel (overflow is collapsed).
+const MAX_GPU_LINES: usize = 8;
+
+/// The GPU section: one row per NVIDIA device (never claiming that a GPU
+/// belongs to the llama-server process), or a single status note.
+fn gpu_lines<'a>(state: &'a AppState, width: u16, symbols: &'a Symbols) -> Vec<Line<'a>> {
+    match &state.gpu {
+        None => {
+            vec![Line::from(format!("{} GPU monitoring: awaiting first sample", symbols.warning()))]
+        }
+        Some(m) => match m.status {
+            GpuMonitorStatus::Available => {
+                let mut out = Vec::new();
+                for g in &m.gpus[..m.gpus.len().min(MAX_GPU_LINES)] {
+                    out.push(Line::from(gpu_row(g, width, symbols)));
+                }
+                if m.gpus.len() > MAX_GPU_LINES {
+                    out.push(Line::from(format!("+{} more GPU(s)", m.gpus.len() - MAX_GPU_LINES)));
+                }
+                out
+            }
+            GpuMonitorStatus::Unavailable => {
+                vec![Line::from(format!(
+                    "{} GPU monitoring unavailable (no NVIDIA device or driver)",
+                    symbols.warning()
+                ))]
+            }
+            GpuMonitorStatus::InitializationFailed => {
+                vec![Line::from(format!(
+                    "{} GPU monitoring failed to initialize (NVML)",
+                    symbols.error()
+                ))]
+            }
+            GpuMonitorStatus::SamplingFailed => {
+                vec![Line::from(format!("{} GPU sampling failed", symbols.warning()))]
+            }
+            GpuMonitorStatus::Disabled => Vec::new(),
+        },
+    }
+}
+
+/// One GPU row: index, name, utilization, VRAM used/total, temperature,
+/// power/limit. Missing values render as placeholders, never as 0.
+fn gpu_row(g: &GpuSnapshot, width: u16, symbols: &Symbols) -> String {
+    let ph = placeholder(symbols).to_string();
+    let util = match g.utilization_percent {
+        Some(u) => format!("{u}%"),
+        None => ph.clone(),
+    };
+    let mem = match (g.memory_used_bytes, g.memory_total_bytes) {
+        (Some(u), Some(t)) if t > 0 => format!("{}/{}", bytes(u), bytes(t)),
+        _ => ph.clone(),
+    };
+    let temp = match g.temperature_celsius {
+        Some(c) => format!("{c}C"),
+        None => ph.clone(),
+    };
+    let power = match g.power_watts {
+        Some(w) => {
+            let limit = g.power_limit_watts.map(|l| format!("/{l:.0}W")).unwrap_or_default();
+            format!("{w:.0}{limit}")
+        }
+        None => ph.clone(),
+    };
+    // The name gets whatever width remains after the fixed fields.
+    let fixed = format!("GPU {:>2}   {util}   {mem}   {temp}   {power}", g.index);
+    let name_budget = (width as usize).saturating_sub(fixed.width() + 3);
+    let name = g.name.as_deref().map(|n| trunc(n, name_budget, symbols.is_ascii())).unwrap_or(ph);
+    format!("{fixed}   {name}")
 }
 
 /// "RAM used/total (pct)" or placeholder when either value is missing.

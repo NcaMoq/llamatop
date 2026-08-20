@@ -123,7 +123,9 @@ impl LlamaCppClient {
     /// Perform a GET, returning `(status, body, process_start_unix)` without
     /// treating non-2xx as an error. Callers interpret the status per
     /// endpoint. The `Process-Start-Time-Unix` header (epoch seconds) is
-    /// remembered on the client for restart detection.
+    /// remembered on the client for restart detection. The body is read with
+    /// a size bound (see [`read_body_bounded`]) so a hostile or misbehaving
+    /// server cannot force an unbounded buffer.
     pub async fn get_raw(&self, path: &str) -> Result<(u16, String, Option<u64>), BackendError> {
         let url = self.url_for(path)?;
         let mut req = self.http.get(url);
@@ -137,7 +139,7 @@ impl LlamaCppClient {
             req = req.header(reqwest::header::AUTHORIZATION, header_value);
         }
 
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| classify_transport_error(self.endpoint().to_string(), path, e))?;
@@ -150,12 +152,67 @@ impl LlamaCppClient {
             .and_then(|v| v.trim().parse::<u64>().ok());
         self.remember_process_start_unix(start_unix);
 
-        let body = resp.text().await.map_err(|e| BackendError::InvalidJson {
+        let body = read_body_bounded(&mut resp, MAX_BODY_BYTES, path).await?;
+        Ok((status, body, start_unix))
+    }
+}
+
+/// Maximum response body size the client will buffer. Monitoring endpoints
+/// return small JSON/text payloads; 16 MiB is far above any legitimate
+/// response while bounding a hostile server's ability to exhaust memory.
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Human-readable form of [`MAX_BODY_BYTES`] for error messages.
+const MAX_BODY_LABEL: &str = "16 MiB";
+
+/// Read a response body as UTF-8 text, enforcing a size limit.
+///
+/// The limit is applied twice: first, when the server declares a
+/// `Content-Length` larger than the limit, the body is rejected without
+/// being read; second, while streaming (covers chunked bodies and lying
+/// `Content-Length`), the accumulated bytes are checked before each chunk is
+/// buffered. The check happens before UTF-8 conversion. The error carries
+/// only the path and the limit, never any body content.
+async fn read_body_bounded(
+    resp: &mut reqwest::Response,
+    limit: usize,
+    path: &str,
+) -> Result<String, BackendError> {
+    if let Some(len) = resp.content_length() {
+        if len > limit as u64 {
+            return Err(BackendError::BodyTooLarge {
+                path: path.to_string(),
+                limit: MAX_BODY_LABEL,
+            });
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = resp.chunk().await.map_err(|e| BackendError::InvalidJson {
             path: path.to_string(),
             detail: format!("cannot read response body: {e}"),
         })?;
-        Ok((status, body, start_unix))
+        match chunk {
+            Some(chunk) => {
+                if buf.len() + chunk.len() > limit {
+                    return Err(BackendError::BodyTooLarge {
+                        path: path.to_string(),
+                        limit: MAX_BODY_LABEL,
+                    });
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            None => break,
+        }
     }
+
+    // Validate UTF-8 only after the size bound has been applied, so an
+    // oversized non-UTF-8 body is reported as too large, not as a UTF-8 error.
+    String::from_utf8(buf).map_err(|e| BackendError::InvalidJson {
+        path: path.to_string(),
+        detail: format!("response body is not valid UTF-8: {e}"),
+    })
 }
 
 /// Map a reqwest transport error to a typed backend error.
@@ -254,5 +311,86 @@ mod tests {
             .expect("valid url");
         let err = client.url_for("http://attacker.example/steal").unwrap_err();
         assert!(matches!(err, BackendError::Parse { .. }));
+    }
+
+    // --- Response body size bound ---
+
+    async fn mount_body(server: &wiremock::MockServer, body: String) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("slots"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        mount_body(&server, "x".repeat(100)).await;
+        let c = LlamaCppClient::new(server.uri().as_str(), Duration::from_secs(1), None)
+            .expect("valid");
+        let url = format!("{}/slots", server.uri());
+        let mut resp = c.http.get(&url).send().await.unwrap();
+        let out = super::read_body_bounded(&mut resp, 100, "slots").await.unwrap();
+        assert_eq!(out.len(), 100, "a body exactly at the limit is accepted");
+    }
+
+    #[tokio::test]
+    async fn body_above_limit_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        // A distinctive payload so we can prove the error carries no body.
+        mount_body(&server, "ZZZZ".repeat(25)).await;
+        let c = LlamaCppClient::new(server.uri().as_str(), Duration::from_secs(1), None)
+            .expect("valid");
+        let url = format!("{}/slots", server.uri());
+        let mut resp = c.http.get(&url).send().await.unwrap();
+        let err = super::read_body_bounded(&mut resp, 99, "slots").await.unwrap_err();
+        assert!(matches!(err, BackendError::BodyTooLarge { .. }), "got {err:?}");
+        // The error message carries no body content.
+        assert!(!err.to_string().contains("ZZZZ"), "body leaked: {}", err);
+    }
+
+    #[tokio::test]
+    async fn chunked_body_above_limit_fails_via_streamed_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A raw HTTP/1.1 server that replies with a chunked body (no
+        // Content-Length) of 1024 bytes. The streamed-read bound must reject
+        // it against a 100-byte limit even though no Content-Length exists.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 8192];
+            let _ = sock.read(&mut req).await;
+            let half = "x".repeat(512);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n200\r\n{half}\r\n200\r\n{half}\r\n0\r\n\r\n"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let url = format!("http://{addr}/slots");
+        let c = LlamaCppClient::new(&url, Duration::from_secs(1), None).unwrap();
+        let mut resp = c.http.get(&url).send().await.unwrap();
+        assert!(resp.content_length().is_none(), "chunked body has no Content-Length");
+        let err = super::read_body_bounded(&mut resp, 100, "slots").await.unwrap_err();
+        assert!(matches!(err, BackendError::BodyTooLarge { .. }), "got {err:?}");
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn small_body_through_get_raw_succeeds() {
+        // The default (16 MiB) limit accepts a normal small response end to
+        // end, and the body is returned intact.
+        let server = wiremock::MockServer::start().await;
+        mount_body(&server, r#"{"ok":true}"#.to_string()).await;
+        let c = LlamaCppClient::new(server.uri().as_str(), Duration::from_secs(1), None)
+            .expect("valid");
+        let (status, body, _) = c.get_raw("slots").await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"ok":true}"#);
     }
 }

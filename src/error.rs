@@ -28,6 +28,11 @@ pub enum BackendError {
     #[error("{path}: could not parse response: {detail}")]
     Parse { path: String, detail: String },
 
+    /// The response body exceeded the configured size limit. The message
+    /// deliberately carries no body content.
+    #[error("{path}: response body exceeds the {limit} limit")]
+    BodyTooLarge { path: String, limit: &'static str },
+
     #[error("authentication failed: the server rejected the API key (HTTP 401)")]
     Authentication,
 
@@ -74,7 +79,8 @@ impl From<&BackendError> for ErrorSeverity {
             | BackendError::HttpStatusWithMessage { .. } => ErrorSeverity::Error,
             BackendError::NotSupported { .. }
             | BackendError::InvalidJson { .. }
-            | BackendError::Parse { .. } => ErrorSeverity::Warning,
+            | BackendError::Parse { .. }
+            | BackendError::BodyTooLarge { .. } => ErrorSeverity::Warning,
         }
     }
 }

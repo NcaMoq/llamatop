@@ -68,7 +68,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          $name = "llamatop-v${version}-x86_64-pc-windows-msvc"
+          $name = "llamatop-v${version}-windows-x86_64"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/x86_64-pc-windows-msvc/release/llamatop.exe" "dist/$name/llamatop.exe"
           Copy-Item "README.md" "dist/$name/README.md"
@@ -76,8 +76,8 @@ jobs:
           Copy-Item "LICENSE" "dist/$name/LICENSE"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "dist/SHA256SUMS.txt" -Value "$hash  $name.zip" -Encoding ascii
-          Get-Content "dist/SHA256SUMS.txt"
+          Set-Content -Path "dist/$name.zip.sha256" -Value $hash -Encoding ascii
+          Get-Content "dist/$name.zip.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -85,11 +85,11 @@ jobs:
           name: llamatop-windows
           path: |
             dist/*.zip
-            dist/SHA256SUMS.txt
+            dist/*.sha256
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.zip
-            dist/SHA256SUMS.txt
+            dist/*.sha256

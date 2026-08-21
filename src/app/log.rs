@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(log.len(), MAX_LOG_EVENTS);
         assert_eq!(
             log.records().front().unwrap().message,
-            format!("event 50"),
+            "event 50".to_string(),
             "the oldest 50 events must have been dropped"
         );
         assert_eq!(log.records().back().unwrap().message, format!("event {}", MAX_LOG_EVENTS + 49));

@@ -459,6 +459,18 @@ mod tests {
         }
     }
 
+    /// A slot with a context occupancy (n_tokens) for utilization tests.
+    fn slot_ctx(
+        id: u32,
+        processing: bool,
+        ctx: Option<u64>,
+        tokens: Option<u64>,
+    ) -> crate::domain::SlotSnapshot {
+        let mut s = slot(id, processing, ctx);
+        s.n_tokens = tokens;
+        s
+    }
+
     /// Connected/ready state with /slots and /metrics available.
     fn connected_slots(overrides: impl FnOnce(&mut BackendSnapshot)) -> AppState {
         let mut state = connected_ready(overrides);
@@ -622,6 +634,49 @@ mod tests {
         assert!(content.contains("ACTIVE"));
         assert!(content.contains("DECODE"));
         assert!(content.contains("8.2K"));
+    }
+
+    #[test]
+    fn slot_context_wide_shows_used_over_max() {
+        // At width 120 the slot table inner width reaches the wide column
+        // set (>= 100), whose Context cell is the used/max shape.
+        let state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, true, Some(40_960), Some(16_384))];
+        });
+        let content = render_content(&state, false, 120, 20);
+        assert!(content.contains("16.4K/41.0K"), "wide Context is used/max: {content}");
+    }
+
+    #[test]
+    fn slot_context_compact_shows_utilization_percentage() {
+        // At width 80 the compact column set shows the percentage.
+        let state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, true, Some(40_960), Some(29_320))];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("71.6%"), "compact Context is a percentage: {content}");
+    }
+
+    #[test]
+    fn slot_context_anomaly_is_not_clamped_to_100() {
+        // n_tokens > n_ctx is a server anomaly: show it, do not clamp.
+        let state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, true, Some(1_024), Some(1_536))];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("150.0%"), "anomaly stays visible: {content}");
+        assert!(!content.contains("100.0%"), "must not clamp to 100%: {content}");
+    }
+
+    #[test]
+    fn slot_context_wide_missing_occupancy_keeps_max() {
+        // Idle slot (no occupancy) in the wide layout: used/max with a
+        // placeholder for the missing half, not a fabricated 0.
+        let state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, false, Some(16_384), None)];
+        });
+        let content = render_content(&state, false, 120, 20);
+        assert!(content.contains("—/16.4K"), "missing occupancy: {content}");
     }
 
     #[test]

@@ -989,7 +989,9 @@ fn slot_cell_values(slot: &SlotSnapshot, symbols: &Symbols, n_data_cols: usize) 
     let phase = slot.phase.display();
     let prompt = format_int(slot.n_prompt_tokens, symbols);
     let generated = format_int(slot.n_decoded, symbols);
-    let context = format_int(slot.n_ctx, symbols);
+    // The wide layout has room for used/max; the compact layouts show the
+    // utilization percentage (or a compact number) instead.
+    let context = format_context_usage(slot.n_tokens, slot.n_ctx, n_data_cols == 6, symbols);
     // Column sets mirror `slot_columns`: wide has Generated, the others
     // drop it; compact also drops Prompt.
     match n_data_cols {
@@ -1012,6 +1014,44 @@ fn format_int(v: Option<u64>, symbols: &Symbols) -> String {
                 n.to_string()
             }
         }
+    }
+}
+
+/// Context utilization for one slot row.
+///
+/// Wide layout: the `used/max` shape in compact form (e.g. `16.4K/41.0K`),
+/// with a placeholder for a missing half (e.g. `—/16.4K`). Compact layout:
+/// the percentage when it is computable (e.g. `71.6%`), otherwise a compact
+/// number (the used value when known, else the max), else the placeholder.
+///
+/// A used value above the window (a server-reported anomaly) is displayed
+/// as-is, never clamped to 100%: `1536/1024` renders as `150.0%`.
+fn format_context_usage(
+    n_tokens: Option<u64>,
+    n_ctx: Option<u64>,
+    wide: bool,
+    symbols: &Symbols,
+) -> String {
+    // Compact rendering of one counter: "16.4K", or the placeholder when
+    // the value is missing (never 0).
+    let compact = |v: Option<u64>| match v {
+        Some(n) => format_int(Some(n), symbols),
+        None => placeholder(symbols).to_string(),
+    };
+    match (n_tokens, n_ctx) {
+        // Compact layout, percentage computable. No clamping: used > max
+        // renders as e.g. "150.0%" — the anomaly is visible, never silently
+        // capped at 100%.
+        (Some(used), Some(max)) if max > 0 && !wide => {
+            format!("{:.1}%", used as f64 / max as f64 * 100.0)
+        }
+        // Wide layout: the used/max shape (max 0 renders as "0").
+        (used, max) if wide && (used.is_some() || max.is_some()) => {
+            format!("{}/{}", compact(used), compact(max))
+        }
+        // Compact layout, percentage not computable (max missing or 0):
+        // used when known, else max, else the placeholder.
+        (used, max) => compact(used.or(max)),
     }
 }
 
@@ -1485,5 +1525,64 @@ mod tests {
         let mut snap = empty_system();
         snap.association = ProcessAssociation::Unavailable;
         assert_eq!(process_line(&snap, &sym), "llama-server process: unavailable");
+    }
+
+    // --- Context utilization ---
+
+    #[test]
+    fn context_usage_wide_shows_used_over_max() {
+        let sym = Symbols::new(false);
+        assert_eq!(format_context_usage(Some(16_384), Some(40_960), true, &sym), "16.4K/41.0K");
+    }
+
+    #[test]
+    fn context_usage_wide_missing_half_is_placeholder() {
+        let sym = Symbols::new(false);
+        assert_eq!(format_context_usage(None, Some(16_384), true, &sym), "—/16.4K");
+        assert_eq!(format_context_usage(Some(500), None, true, &sym), "500/—");
+        assert_eq!(format_context_usage(None, None, true, &sym), "—");
+        // ASCII mode uses the ASCII placeholder.
+        let ascii = Symbols::new(true);
+        assert_eq!(format_context_usage(None, Some(16_384), true, &ascii), "-/16.4K");
+    }
+
+    #[test]
+    fn context_usage_compact_shows_percentage() {
+        let sym = Symbols::new(false);
+        assert_eq!(format_context_usage(Some(29_320), Some(40_960), false, &sym), "71.6%");
+    }
+
+    #[test]
+    fn context_usage_anomaly_is_not_clamped_to_100() {
+        let sym = Symbols::new(false);
+        // 1536 used of a 1024 window: the anomaly must stay visible.
+        assert_eq!(format_context_usage(Some(1_536), Some(1_024), false, &sym), "150.0%");
+        // Wide keeps the used/max shape with the (compact) numbers as-is.
+        assert_eq!(format_context_usage(Some(1_536), Some(1_024), true, &sym), "1.5K/1.0K");
+    }
+
+    #[test]
+    fn context_usage_compact_falls_back_to_compact_numbers() {
+        let sym = Symbols::new(false);
+        // Max missing: show the used value.
+        assert_eq!(format_context_usage(Some(187_800), None, false, &sym), "187.8K");
+        // Max 0: no division, show the used value.
+        assert_eq!(format_context_usage(Some(5), Some(0), false, &sym), "5");
+        // Used missing: keep showing the max (idle slot).
+        assert_eq!(format_context_usage(None, Some(16_384), false, &sym), "16.4K");
+        // Both missing: placeholder, never 0.
+        assert_eq!(format_context_usage(None, None, false, &sym), "—");
+        let ascii = Symbols::new(true);
+        assert_eq!(format_context_usage(None, None, false, &ascii), "-");
+    }
+
+    #[test]
+    fn context_usage_never_panics_on_extreme_values() {
+        let sym = Symbols::new(false);
+        // u64 extremes must not overflow or panic.
+        let _ = format_context_usage(Some(u64::MAX), Some(1), false, &sym);
+        let _ = format_context_usage(Some(u64::MAX), Some(u64::MAX), true, &sym);
+        let pct = format_context_usage(Some(u64::MAX), Some(1), false, &sym);
+        assert!(pct.ends_with('%'), "huge ratio renders a percentage, not garbage: {pct}");
     }
 }

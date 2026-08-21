@@ -17,14 +17,17 @@ use crate::app::event::{AppEvent, InputAction};
 
 /// Map a raw key event to an application action, if any.
 ///
-/// Only keys with an implemented, visible effect are bound. Keys whose
-/// features are not implemented yet (help modal, slot detail, panel focus)
-/// map to `None` so they cannot change state or make the TUI look frozen.
-/// They are re-enabled when the feature ships.
+/// Only keys with an implemented, visible effect are bound. Tab/Shift+Tab
+/// (panel focus) and Enter (slot detail) have no visible target in the
+/// current layout, so they map to `None`: they cannot change state or make
+/// the TUI look frozen.
 pub fn key_to_action(code: KeyCode, modifiers: KeyModifiers) -> Option<InputAction> {
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(InputAction::Quit),
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(InputAction::Quit),
+        // Ctrl+C always quits — even while the help modal is open.
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(InputAction::ForceQuit)
+        }
         KeyCode::Char('r') => Some(InputAction::Reconnect),
         KeyCode::Char('p') => Some(InputAction::TogglePause),
         // Slot table navigation: arrows and vim-style j/k. Whether they
@@ -124,7 +127,7 @@ mod tests {
         assert_eq!(key(KeyCode::Char('Q')), Some(InputAction::Quit));
         assert_eq!(
             key_to_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            Some(InputAction::Quit)
+            Some(InputAction::ForceQuit)
         );
     }
 

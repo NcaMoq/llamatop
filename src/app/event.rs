@@ -41,8 +41,10 @@ pub enum AppEvent {
 /// decisions out of the rendering code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
-    /// `q` or Ctrl+C
+    /// `q` — quit (blocked while the help modal is open)
     Quit,
+    /// Ctrl+C — quit, even while the help modal is open
+    ForceQuit,
     /// `r` — manual reconnect
     Reconnect,
     /// `p` — pause or resume the displayed snapshot
@@ -51,16 +53,10 @@ pub enum InputAction {
     ToggleHelp,
     /// `Esc` — close the help modal or other modal
     CloseModal,
-    /// `Tab` — focus the next panel
-    FocusNext,
-    /// `Shift+Tab` — focus the previous panel
-    FocusPrev,
     /// `Up` / `k` — move slot selection up
     SlotUp,
     /// `Down` / `j` — move slot selection down
     SlotDown,
-    /// `Enter` — open or close the selected slot details
-    ToggleSlotDetail,
     /// `l` — toggle the event log panel
     ToggleEvents,
     /// `c` — clear the event log (when the event log is visible) or the

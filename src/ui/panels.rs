@@ -932,11 +932,18 @@ fn render_slots(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) 
         .iter()
         .enumerate()
         .map(|(i, slot)| {
-            let marker = if i == state.selected_slot { sel_marker } else { "  " };
+            let selected = i == state.selected_slot;
+            let marker = if selected { sel_marker } else { "  " };
             let mut cells: Vec<String> = Vec::with_capacity(headers.len() + 1);
             cells.push(marker.to_string());
             cells.extend(slot_cell_values(slot, symbols, headers.len()));
-            Row::new(cells)
+            // The table is rendered without a TableState, so the selection is
+            // styled directly on the row (in addition to the marker).
+            if selected {
+                Row::new(cells).style(Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Row::new(cells)
+            }
         })
         .collect();
 
@@ -950,9 +957,7 @@ fn render_slots(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) 
     let offset = state.slot_scroll_offset(viewport);
     let visible: Vec<Row> = rows[offset..offset + viewport].to_vec();
 
-    let table = ratatui::widgets::Table::new(visible, widths)
-        .header(header)
-        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let table = ratatui::widgets::Table::new(visible, widths).header(header);
     f.render_widget(table, inner);
 }
 

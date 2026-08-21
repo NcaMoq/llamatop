@@ -14,4 +14,4 @@ pub mod state;
 pub use event::{AppEvent, BackendErrorSummary, CollectorCommand, InputAction};
 pub use history::{History, HistorySample, MAX_HISTORY_SAMPLES};
 pub use log::{EventKind, EventLog, EventRecord, EventSeverity};
-pub use state::{AppState, FocusedPanel};
+pub use state::AppState;

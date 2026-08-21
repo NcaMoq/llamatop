@@ -20,34 +20,6 @@ use crate::domain::{
     WorkloadPhase,
 };
 
-/// Panels the focus cycle (Tab / Shift+Tab) moves between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FocusedPanel {
-    /// The slots table (default focus).
-    #[default]
-    Slots,
-    /// The history panel.
-    History,
-    /// The event log panel.
-    Events,
-    /// The Resources panel (host + llama-server process).
-    Resources,
-}
-
-impl FocusedPanel {
-    const ALL: [FocusedPanel; 4] =
-        [FocusedPanel::Slots, FocusedPanel::History, FocusedPanel::Events, FocusedPanel::Resources];
-
-    pub fn next(self) -> Self {
-        Self::ALL[(Self::ALL.iter().position(|p| *p == self).unwrap_or(0) + 1) % Self::ALL.len()]
-    }
-
-    pub fn prev(self) -> Self {
-        let idx = Self::ALL.iter().position(|p| *p == self).unwrap_or(0);
-        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
-    }
-}
-
 /// The single owner of all TUI state.
 pub struct AppState {
     // --- static configuration (display only, set once) ---
@@ -86,8 +58,6 @@ pub struct AppState {
     /// The renderer derives the exact offset each frame; this value keeps
     /// the position stable while the selection stays inside the viewport.
     pub slot_scroll: usize,
-    pub slot_detail_open: bool,
-    pub focused_panel: FocusedPanel,
     pub paused: bool,
     pub frozen_snapshot: Option<BackendSnapshot>,
     pub show_help: bool,
@@ -122,8 +92,6 @@ impl AppState {
             selected_slot: 0,
             event_scroll: 0,
             slot_scroll: 0,
-            slot_detail_open: false,
-            focused_panel: FocusedPanel::default(),
             paused: false,
             frozen_snapshot: None,
             show_help: false,
@@ -279,15 +247,21 @@ impl AppState {
 
     /// Apply a keyboard action.
     pub fn handle_input(&mut self, action: InputAction) {
-        // While the help modal is open, background input is blocked: only the
-        // actions that close or toggle the modal apply. In particular `q`
-        // does NOT quit while the modal is open (close it first with `?`/Esc).
-        if self.show_help && !matches!(action, InputAction::ToggleHelp | InputAction::CloseModal) {
+        // While the help modal is open, background input is blocked: only
+        // the actions that close or toggle the modal apply — and Ctrl+C
+        // (ForceQuit), which always quits. `q` does NOT quit while the modal
+        // is open (close it first with `?`/Esc).
+        if self.show_help
+            && !matches!(
+                action,
+                InputAction::ToggleHelp | InputAction::CloseModal | InputAction::ForceQuit
+            )
+        {
             return;
         }
 
         match action {
-            InputAction::Quit => self.should_quit = true,
+            InputAction::Quit | InputAction::ForceQuit => self.should_quit = true,
             InputAction::Reconnect => {
                 self.reconnect_requested = true;
                 self.log(
@@ -301,15 +275,11 @@ impl AppState {
             InputAction::CloseModal => {
                 if self.show_help {
                     self.show_help = false;
-                } else if self.slot_detail_open {
-                    self.slot_detail_open = false;
                 } else if self.show_events {
                     self.show_events = false;
                     self.event_scroll = 0;
                 }
             }
-            InputAction::FocusNext => self.focused_panel = self.focused_panel.next(),
-            InputAction::FocusPrev => self.focused_panel = self.focused_panel.prev(),
             InputAction::SlotUp => {
                 if self.can_select_slot() && self.selected_slot > 0 {
                     self.set_selected_slot(self.selected_slot - 1);
@@ -320,11 +290,9 @@ impl AppState {
                     self.set_selected_slot(self.selected_slot + 1);
                 }
             }
-            InputAction::ToggleSlotDetail => self.slot_detail_open = !self.slot_detail_open,
             InputAction::ToggleEvents => {
                 self.show_events = !self.show_events;
                 if self.show_events {
-                    self.focused_panel = FocusedPanel::Events;
                     self.event_scroll = 0;
                 }
             }
@@ -476,7 +444,6 @@ impl AppState {
             if snap.slots.is_empty() {
                 self.selected_slot = 0;
                 self.slot_scroll = 0;
-                self.slot_detail_open = false;
             } else {
                 self.selected_slot = self.select_for_slots(&snap.slots);
             }
@@ -1418,6 +1385,9 @@ mod tests {
         s.handle_input(InputAction::SlotDown); // ignored while help is open
         s.handle_input(InputAction::Quit); // q must NOT quit while help is open
         assert!(!s.should_quit, "q is blocked while the help modal is open");
+        // Ctrl+C is the exception: it quits even while the modal is open.
+        s.handle_input(InputAction::ForceQuit);
+        assert!(s.should_quit, "Ctrl+C quits while the help modal is open");
         s.handle_input(InputAction::CloseModal);
         assert!(!s.show_help);
         // After closing the modal, background actions apply again.

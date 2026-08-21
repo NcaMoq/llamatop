@@ -5,30 +5,56 @@ on:
     branches: [main]
   pull_request:
 
+# Every run must verify the exact locked dependency set. The matrix covers
+# the MSRV (from rust-version in Cargo.toml) and stable; the Windows release
+# build is required in both legs, so a broken Windows build can never be
+# merged or released.
 jobs:
   check:
+    name: Check (Rust ${{ matrix.toolchain }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.85", "stable"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: |
-          rustup update stable
-          rustup default stable
-          rustup component add rustfmt clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
 
+      # The cache key includes Cargo.lock, so a lockfile change invalidates
+      # the cache and the build always matches the committed lock.
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.toolchain }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.toolchain }}-${{ runner.os }}-
+
+      # fmt and clippy run on stable: that toolchain defines the lint and
+      # formatting baseline. The MSRV leg verifies compilation and tests.
       - name: Check formatting
+        if: matrix.toolchain == 'stable'
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked --all-features
 
-      - name: Release build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Release build (required)
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
 
       - name: Verify executable
         shell: pwsh

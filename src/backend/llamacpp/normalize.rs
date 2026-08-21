@@ -194,16 +194,18 @@ mod tests {
 
     #[test]
     fn slots_normalize_idle_and_processing() {
+        let nt = |n_decoded: Option<u64>| {
+            crate::backend::llamacpp::slots::OneOrMany::One(
+                crate::backend::llamacpp::slots::RawNextToken { n_decoded, ..Default::default() },
+            )
+        };
         let raw = vec![
             RawSlot {
                 id: 0,
                 is_processing: true,
                 n_ctx: Some(4096),
                 n_prompt_tokens: Some(10),
-                next_token: Some(crate::backend::llamacpp::slots::RawNextToken {
-                    n_decoded: Some(3),
-                    ..Default::default()
-                }),
+                next_token: Some(nt(Some(3))),
                 ..Default::default()
             },
             RawSlot { id: 1, is_processing: false, n_ctx: None, ..Default::default() },
@@ -212,9 +214,77 @@ mod tests {
         let snap = normalize(&obs);
         assert_eq!(snap.slots.len(), 2);
         assert_eq!(snap.slots[0].phase, SlotPhase::ProcessingUnknown);
-        assert_eq!(snap.slots[0].n_tokens, Some(13));
+        // Context occupancy is the prompt buffer; the decoded counter is
+        // tracked separately (phase detection) and not added on top.
+        assert_eq!(snap.slots[0].n_tokens, Some(10));
+        assert_eq!(snap.slots[0].n_decoded, Some(3));
         assert_eq!(snap.slots[1].phase, SlotPhase::Idle);
         assert_eq!(snap.slots[1].n_tokens, None);
+    }
+
+    #[test]
+    fn live_schema_maps_prompt_buffer_to_context_usage() {
+        // The current llama.cpp shape: no n_tokens, prompt buffer 58029 in a
+        // 237568 window, idle (no task counters beyond the prompt).
+        let raw = vec![RawSlot {
+            id: 0,
+            n_ctx: Some(237568),
+            speculative: true,
+            is_processing: false,
+            id_task: Some(1000),
+            n_prompt_tokens: Some(58029),
+            n_prompt_tokens_processed: Some(0),
+            n_prompt_tokens_cache: Some(0),
+            next_token: Some(crate::backend::llamacpp::slots::OneOrMany::Many(vec![
+                crate::backend::llamacpp::slots::RawNextToken {
+                    n_decoded: Some(0),
+                    ..Default::default()
+                },
+            ])),
+            ..Default::default()
+        }];
+        let obs = RawObservation { slots: Some(raw), ..Default::default() };
+        let snap = normalize(&obs);
+        assert_eq!(snap.slots[0].phase, SlotPhase::Idle);
+        assert_eq!(snap.slots[0].n_ctx, Some(237568));
+        assert_eq!(snap.slots[0].n_tokens, Some(58029));
+        assert_eq!(snap.slots[0].n_decoded, Some(0));
+    }
+
+    #[test]
+    fn prompt_sub_counts_are_not_double_counted() {
+        // processed and cache describe how the prompt buffer got there; they
+        // must not be summed into the occupancy.
+        let raw = vec![RawSlot {
+            id: 0,
+            is_processing: true,
+            n_ctx: Some(65536),
+            n_prompt_tokens: Some(1000),
+            n_prompt_tokens_processed: Some(350),
+            n_prompt_tokens_cache: Some(200),
+            ..Default::default()
+        }];
+        let obs = RawObservation { slots: Some(raw), ..Default::default() };
+        let snap = normalize(&obs);
+        assert_eq!(snap.slots[0].n_tokens, Some(1000));
+    }
+
+    #[test]
+    fn old_schema_n_tokens_precedes_prompt_buffer() {
+        let raw = vec![RawSlot {
+            id: 0,
+            is_processing: true,
+            n_ctx: Some(4096),
+            n_tokens: Some(16384),
+            n_prompt_tokens: Some(100),
+            ..Default::default()
+        }];
+        let obs = RawObservation { slots: Some(raw), ..Default::default() };
+        let snap = normalize(&obs);
+        assert_eq!(snap.slots[0].n_tokens, Some(16384));
+        // An occupancy above the window is preserved as reported: clamping
+        // is a display decision, not a mapping one.
+        assert_eq!(snap.slots[0].n_ctx, Some(4096));
     }
 
     #[test]

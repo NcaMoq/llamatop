@@ -1,0 +1,25 @@
+[
+  {
+    "id": 0,
+    "n_ctx": 237568,
+    "speculative": true,
+    "is_processing": false,
+    "id_task": 1000,
+    "n_prompt_tokens": 58029,
+    "n_prompt_tokens_processed": 0,
+    "n_prompt_tokens_cache": 0,
+    "params": {
+      "temperature": 1.0,
+      "top_k": 20,
+      "top_p": 0.95
+    },
+    "next_token": [
+      {
+        "has_next_token": false,
+        "has_new_line": false,
+        "n_remain": -1,
+        "n_decoded": 0
+      }
+    ]
+  }
+]

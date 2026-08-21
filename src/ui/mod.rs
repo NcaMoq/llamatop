@@ -679,6 +679,56 @@ mod tests {
         assert!(content.contains("—/16.4K"), "missing occupancy: {content}");
     }
 
+    /// The live-server values (58029 used of a 237568 window, idle) must
+    /// render a slot row: used/max in the wide layout.
+    #[test]
+    fn live_fixture_slot_row_wide() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, false, Some(237_568), Some(58_029))];
+        });
+        let content = render_content(&state, false, 120, 20);
+        assert!(content.contains("IDLE"), "idle slot row: {content}");
+        assert!(content.contains("58.0K/237.6K"), "wide Context is used/max: {content}");
+    }
+
+    /// Same live-server values at 80x20: the compact layout shows the
+    /// utilization percentage and still renders at least one slot row.
+    #[test]
+    fn live_fixture_slot_row_compact_at_80x20() {
+        let state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, false, Some(237_568), Some(58_029))];
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("IDLE"), "slot row must be visible: {content}");
+        assert!(content.contains("24.4%"), "compact Context is a percentage: {content}");
+    }
+
+    /// A slots parse failure shows the warning; when the next observation
+    /// parses, the warning is gone and the slot row returns.
+    #[test]
+    fn parse_warning_disappears_after_successful_recovery() {
+        let mut state = connected_slots(|s| {
+            s.slots = vec![slot_ctx(0, false, Some(237_568), Some(58_029))];
+        });
+        state.apply_capabilities(crate::backend::BackendCapabilities {
+            slots: crate::backend::EndpointAvailability::ParseFailed,
+            metrics: crate::backend::EndpointAvailability::Available,
+            ..Default::default()
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Slots response could not be parsed"), "{content}");
+        assert!(!content.contains("58.0K"), "no slot data while unparseable: {content}");
+
+        state.apply_capabilities(crate::backend::BackendCapabilities {
+            slots: crate::backend::EndpointAvailability::Available,
+            metrics: crate::backend::EndpointAvailability::Available,
+            ..Default::default()
+        });
+        let content = render_content(&state, false, 80, 20);
+        assert!(!content.contains("could not be parsed"), "warning must clear: {content}");
+        assert!(content.contains("24.4%"), "slot row returns after recovery: {content}");
+    }
+
     #[test]
     fn slot_rows_render_in_id_order() {
         // Deliberately out of API order; distinct context values mark rows.

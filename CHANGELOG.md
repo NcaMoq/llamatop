@@ -48,6 +48,20 @@ All notable changes to llamatop are documented here.
   displayed; API keys are never displayed, logged, or written to disk;
   transport errors are redacted.
 
+### Fixed
+
+- Parsing of the current llama.cpp `/slots` schema: `next_token` is an array
+  of one object in current builds (a single object in older builds; both
+  forms are accepted) and prompt occupancy is reported as
+  `n_prompt_tokens` (the `n_prompt_tokens_processed`/`_cache` sub-counters
+  are never summed into it). Older builds that still report a top-level
+  `n_tokens` keep working and take precedence.
+- Noisy `/slots` polling: the default slot interval is now 1000 ms (was
+  250 ms), and after a `/slots` response that cannot be parsed, the next
+  fetch is delayed by at least 5000 ms until a response parses again.
+  Transport errors keep the normal interval; a manual reconnect bypasses
+  the delay.
+
 ### Security hardening
 
 - Endpoint URLs containing userinfo (username/password), query strings, or

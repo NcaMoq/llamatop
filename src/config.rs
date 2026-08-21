@@ -16,7 +16,7 @@ use crate::error::{ConfigError, ConfigResult};
 
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_REFRESH_INTERVAL_MS: u64 = 500;
-pub const DEFAULT_SLOT_INTERVAL_MS: u64 = 250;
+pub const DEFAULT_SLOT_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_METRICS_INTERVAL_MS: u64 = 500;
 pub const DEFAULT_HEALTH_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_PROPS_INTERVAL_MS: u64 = 2000;

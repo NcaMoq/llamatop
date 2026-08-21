@@ -26,7 +26,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::app::event::{AppEvent, BackendErrorSummary, CollectorCommand};
 use crate::backend::llamacpp::LlamaCppBackend;
-use crate::backend::{EndpointDue, InferenceBackend};
+use crate::backend::{EndpointAvailability, EndpointDue, InferenceBackend};
 use crate::config::{Config, MIN_INTERVAL_MS};
 use crate::detector::StateDetector;
 use crate::domain::{BackendSnapshot, ConnectionState};
@@ -35,6 +35,13 @@ use crate::domain::{BackendSnapshot, ConnectionState};
 /// clamped so deadline arithmetic can never overflow and every endpoint is
 /// still re-observed on a bounded cycle.
 const MAX_ENDPOINT_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Extra delay applied to the next `/slots` fetch after a response that the
+/// server answered but we could not parse. Polling an unparseable endpoint
+/// on the normal interval only adds log noise on the server side (`srv
+/// update_slots: all slots are idle`), so parse failures are re-observed at
+/// most once per five seconds until a response parses again.
+const SLOTS_PARSE_FAILED_BACKOFF: Duration = Duration::from_millis(5000);
 
 /// Per-endpoint schedule for the collector loop.
 ///
@@ -88,12 +95,22 @@ impl EndpointSchedule {
     /// After a cycle: the endpoints that were fetched get their next
     /// deadline set to `at` + their interval. Endpoints that were not due
     /// keep their existing deadline.
-    fn advance(&mut self, due: EndpointDue, at: Instant) {
+    ///
+    /// A `/slots` fetch whose latest observation is `ParseFailed` is
+    /// scheduled with `max(interval, 5s)` instead of the normal interval;
+    /// any other observation (including transport errors) — and in
+    /// particular a successful parse — restores the normal interval.
+    fn advance(&mut self, due: EndpointDue, at: Instant, slots_obs: EndpointAvailability) {
         if due.health {
             self.next_health = at + self.interval_health;
         }
         if due.slots {
-            self.next_slots = at + self.interval_slots;
+            let interval = if slots_obs == EndpointAvailability::ParseFailed {
+                self.interval_slots.max(SLOTS_PARSE_FAILED_BACKOFF)
+            } else {
+                self.interval_slots
+            };
+            self.next_slots = at + interval;
         }
         if due.metrics {
             self.next_metrics = at + self.interval_metrics;
@@ -167,7 +184,7 @@ pub async fn run(
         if let Some(snapshot) = snapshot {
             emit_snapshot(snapshot, &mut detector, &events);
         }
-        schedule.advance(due, Instant::now());
+        schedule.advance(due, Instant::now(), capabilities.slots);
 
         tokio::select! {
             command = commands.recv() => {
@@ -232,7 +249,7 @@ mod tests {
         // Health every 100ms, slots every 300ms.
         let mut s = EndpointSchedule::new(&config_with(100, 300));
         let t0 = Instant::now();
-        s.advance(EndpointDue::ALL, t0);
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::Available);
         assert_eq!(
             (s.interval_health, s.interval_slots),
             (Duration::from_millis(100), Duration::from_millis(300))
@@ -243,7 +260,7 @@ mod tests {
         let due1 = s.due(t1);
         assert!(due1.health, "health is due at 150ms");
         assert!(!due1.slots, "slots is not due until 300ms");
-        s.advance(due1, t1);
+        s.advance(due1, t1, EndpointAvailability::Available);
 
         // At t0+250: neither is due (next health t0+250 not reached yet
         // strictly, slots t0+300).
@@ -255,7 +272,7 @@ mod tests {
         let t3 = t0 + Duration::from_millis(260);
         let due3 = s.due(t3);
         assert!(due3.health && !due3.slots, "health re-due on its own interval");
-        s.advance(due3, t3);
+        s.advance(due3, t3, EndpointAvailability::Available);
 
         // At t0+400: slots is due (t0+300), health is not (next t0+360+... =
         // t3+100 = t0+360 -> due at t0+360, so also due here).
@@ -278,7 +295,7 @@ mod tests {
         };
         let mut s = EndpointSchedule::new(&config);
         let t0 = Instant::now();
-        s.advance(EndpointDue::ALL, t0);
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::Available);
         assert_eq!(
             (s.interval_metrics, s.interval_props),
             (Duration::from_millis(300), Duration::from_millis(500))
@@ -294,14 +311,14 @@ mod tests {
         assert!(due2.health && due2.slots, "health/slots due on their 100ms");
         assert!(!due2.metrics, "metrics not due until 300ms");
         assert!(!due2.props, "props not due until 500ms");
-        s.advance(due2, t2);
+        s.advance(due2, t2, EndpointAvailability::Available);
 
         // At t0+320: metrics is due (300ms); props still is not (500ms).
         let t3 = t0 + Duration::from_millis(320);
         let due3 = s.due(t3);
         assert!(due3.metrics, "metrics due after 300ms");
         assert!(!due3.props, "props not due until 500ms");
-        s.advance(due3, t3);
+        s.advance(due3, t3, EndpointAvailability::Available);
 
         // At t0+520: props due (500ms).
         let t4 = t0 + Duration::from_millis(520);
@@ -312,7 +329,7 @@ mod tests {
     fn wait_is_the_earliest_deadline() {
         let mut s = EndpointSchedule::new(&config_with(100, 300));
         let t0 = Instant::now();
-        s.advance(EndpointDue::ALL, t0);
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::Available);
         // The next cycle must wait for health (100ms), not slots (300ms).
         let w = s.wait(t0 + Duration::from_millis(10));
         assert!(
@@ -325,7 +342,7 @@ mod tests {
     fn reconnect_makes_every_endpoint_immediately_due() {
         let mut s = EndpointSchedule::new(&config_with(100, 300));
         let t0 = Instant::now();
-        s.advance(EndpointDue::ALL, t0);
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::Available);
         let t1 = t0 + Duration::from_millis(50);
         assert!(!s.due(t1).slots, "slots not yet due");
         s.mark_all_due(t1);
@@ -333,12 +350,149 @@ mod tests {
         assert_eq!(s.wait(t1), Duration::ZERO, "no wait after reconnect");
     }
 
+    // --- ParseFailed backoff (pure deadline math, no real sleeps) ---
+
+    #[test]
+    fn default_slot_interval_is_one_second() {
+        let s = EndpointSchedule::new(&Config::default());
+        assert_eq!(s.interval_slots, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn parse_failed_slots_are_scheduled_with_five_second_backoff() {
+        let mut s = EndpointSchedule::new(&config_with(100, 1000));
+        let t0 = Instant::now();
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::ParseFailed);
+
+        // The normal slot deadline (t0+1000) must not be the next fetch;
+        // the backoff deadline (t0+5000) is.
+        assert!(!s.due(t0 + Duration::from_millis(1500)).slots);
+        assert!(!s.due(t0 + Duration::from_millis(4900)).slots);
+        assert!(s.due(t0 + Duration::from_millis(5000)).slots);
+    }
+
+    #[test]
+    fn backoff_never_shortens_a_larger_slot_interval() {
+        // A user-configured 10s interval is already slower than the backoff;
+        // keep it as-is (max, not a replacement).
+        let mut s = EndpointSchedule::new(&config_with(100, 10_000));
+        let t0 = Instant::now();
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::ParseFailed);
+        assert!(!s.due(t0 + Duration::from_millis(6000)).slots);
+        assert!(s.due(t0 + Duration::from_millis(10_000)).slots);
+    }
+
+    #[test]
+    fn successful_parse_restores_the_normal_interval() {
+        let mut s = EndpointSchedule::new(&config_with(100, 1000));
+        let t0 = Instant::now();
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::ParseFailed);
+
+        // Backoff deadline reached; the response parses this time.
+        let t1 = t0 + Duration::from_millis(5000);
+        assert!(s.due(t1).slots);
+        s.advance(s.due(t1), t1, EndpointAvailability::Available);
+
+        // The next fetch is back on the normal 1s interval, not another
+        // 5s backoff.
+        assert!(!s.due(t1 + Duration::from_millis(900)).slots);
+        assert!(s.due(t1 + Duration::from_millis(1000)).slots);
+    }
+
+    #[test]
+    fn transport_failure_does_not_extend_the_interval() {
+        // Timeouts and server errors are retried on the normal cycle by the
+        // availability model; only a parse failure adds the backoff.
+        let mut s = EndpointSchedule::new(&config_with(100, 1000));
+        let t0 = Instant::now();
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::TemporarilyUnavailable);
+        assert!(s.due(t0 + Duration::from_millis(1000)).slots);
+    }
+
+    #[test]
+    fn reconnect_bypasses_the_parse_failed_backoff() {
+        let mut s = EndpointSchedule::new(&config_with(100, 1000));
+        let t0 = Instant::now();
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::ParseFailed);
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(!s.due(t1).slots, "still in backoff before the reconnect");
+        s.mark_all_due(t1);
+        assert!(s.due(t1).slots, "manual reconnect fetches slots immediately");
+    }
+
+    #[test]
+    fn repeated_parse_failed_stays_on_the_backoff_interval() {
+        let mut s = EndpointSchedule::new(&config_with(100, 1000));
+        let start = Instant::now();
+        let mut t = start;
+        for i in 0..3 {
+            s.advance(EndpointDue::ALL, t, EndpointAvailability::ParseFailed);
+            let next = t + SLOTS_PARSE_FAILED_BACKOFF;
+            assert!(s.due(next).slots, "cycle {i}: backoff deadline reached");
+            t = next;
+        }
+        assert_eq!(t, start + SLOTS_PARSE_FAILED_BACKOFF * 3);
+    }
+
+    /// The collector loop must apply the backoff to real fetches: an
+    /// unparseable /slots body is fetched once per backoff window, not on
+    /// the normal interval. The other endpoints run on a long interval so
+    /// the slots deadline is the only thing that could wake the loop early.
+    #[tokio::test]
+    async fn parse_failed_slots_are_fetched_at_most_once_per_backoff() {
+        use tokio::sync::mpsc::unbounded_channel;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (p, body) in
+            [("health", r#"{"status":"ok"}"#), ("metrics", ""), ("props", r#"{"total_slots":1}"#)]
+        {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+        // 200, but a body /slots cannot parse.
+        Mock::given(method("GET"))
+            .and(path("slots"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let config = Config {
+            endpoint: server.uri(),
+            refresh_interval_ms: 60_000,
+            slot_interval_ms: 100,
+            metrics_interval_ms: 60_000,
+            health_interval_ms: 60_000,
+            props_interval_ms: 60_000,
+            request_timeout_ms: 500,
+            ..Default::default()
+        };
+        let (tx, _rx) = unbounded_channel();
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let handle = tokio::spawn(run(config, tx, cmd_rx));
+
+        // Initial probe (1) + first cycle fetch (1); the parse failure then
+        // pushes the next slots fetch 5s out, beyond this window. The Stop
+        // below also proves the backoff wait is interruptible.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        cmd_tx.send(CollectorCommand::Stop).expect("send");
+        handle.await.expect("collector exits");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let slots_hits = requests.iter().filter(|r| r.url.path() == "/slots").count();
+        assert_eq!(slots_hits, 2, "probe + first fetch only; the backoff must suppress the rest");
+    }
+
     #[test]
     fn intervals_are_clamped_to_the_minimum() {
         // A zero interval must not create a zero-length busy loop.
         let mut s = EndpointSchedule::new(&config_with(0, 0));
         let t0 = Instant::now();
-        s.advance(EndpointDue::ALL, t0);
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::Available);
         assert!(
             s.wait(t0) >= Duration::from_millis(100),
             "a clamped interval must keep the cycle >= 100ms"
@@ -354,7 +508,7 @@ mod tests {
         };
         let mut s = EndpointSchedule::new(&config);
         let t0 = Instant::now();
-        s.advance(EndpointDue::ALL, t0); // must not panic
+        s.advance(EndpointDue::ALL, t0, EndpointAvailability::Available); // must not panic
         assert!(s.wait(t0) <= MAX_ENDPOINT_INTERVAL);
         // And the deadline is still reachable: it is bounded.
         assert!(s.next_health >= t0);

@@ -190,6 +190,16 @@ Phases are inferred from counter deltas, never guessed:
 `*` / `?` mark estimated or unknown values in the display. Queued requests are
 reported separately; a queue is not a phase.
 
+### Polling
+
+Each endpoint is fetched on its own interval (defaults: `/health` 1000 ms,
+`/slots` 1000 ms, `/metrics` 500 ms, `/props` 2000 ms; `refresh_interval_ms`
+controls the render cycle and does not fetch). When `/slots` answers but the
+body cannot be parsed, the next `/slots` fetch is delayed by at least 5 s
+until a response parses again — polling an unparseable endpoint on the
+normal interval only adds log noise on the server side. A manual reconnect
+(`r`) bypasses the delay and fetches immediately.
+
 ## Security and privacy
 
 - Prompts and completions are never fetched, logged, or displayed.

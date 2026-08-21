@@ -46,7 +46,7 @@ impl Snapshot {
 /// snapshot (connection = Disconnected/Error) so the renderer can report
 /// them. Only client-construction failures return `Err`.
 pub async fn capture(config: &Config) -> anyhow::Result<Snapshot> {
-    let backend = LlamaCppBackend::new(
+    let mut backend = LlamaCppBackend::new(
         &config.endpoint,
         config.request_timeout(),
         config.api_key().as_deref(),

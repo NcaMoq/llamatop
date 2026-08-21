@@ -9,7 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tracing::warn;
 
-use super::{BackendCapabilities, BackendHealth, EndpointAvailability, InferenceBackend};
+use super::{
+    BackendCapabilities, BackendHealth, EndpointAvailability, EndpointDue, InferenceBackend,
+};
 use crate::domain::BackendSnapshot;
 use crate::error::BackendError;
 
@@ -25,8 +27,16 @@ use client::LlamaCppClient;
 use normalize::{normalize, RawObservation};
 
 /// The llama.cpp inference backend.
+///
+/// The `last_*` fields are the last *successful* observation per endpoint,
+/// kept so `snapshot_due` can serve endpoints that are not due yet. This is
+/// a value cache, not a schedule: no timestamps or intervals live here.
 pub struct LlamaCppBackend {
     client: LlamaCppClient,
+    last_health: Option<health::HealthOutcome>,
+    last_slots: Option<Vec<slots::RawSlot>>,
+    last_metrics: Option<metrics::LlamaCppRawMetrics>,
+    last_props: Option<props::RawProps>,
 }
 
 impl LlamaCppBackend {
@@ -36,7 +46,13 @@ impl LlamaCppBackend {
         api_key: Option<&str>,
     ) -> Result<Self, BackendError> {
         let client = LlamaCppClient::new(endpoint, timeout, api_key)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            last_health: None,
+            last_slots: None,
+            last_metrics: None,
+            last_props: None,
+        })
     }
 
     pub fn endpoint(&self) -> &str {
@@ -105,74 +121,98 @@ impl InferenceBackend for LlamaCppBackend {
         Ok(BackendHealth { server: outcome.server, detail: outcome.detail })
     }
 
+    /// One-shot capture: fetch every endpoint (the cache starts empty, so
+    /// this behaves exactly like `snapshot_due(ALL)`).
     async fn snapshot(
-        &self,
+        &mut self,
         capabilities: &mut BackendCapabilities,
     ) -> Result<BackendSnapshot, BackendError> {
-        // Health is the authoritative reachability check and is re-observed
-        // every snapshot regardless of its previous state: it doubles as the
-        // connection heartbeat.
-        let (health_availability, outcome) = match self.client.get_raw("health").await {
-            Ok((status, body, _)) => health::classify_health(status, &body),
-            Err(BackendError::Authentication) => {
-                capabilities.health = EndpointAvailability::AuthenticationFailed;
-                return Err(BackendError::Authentication);
-            }
-            Err(err) => {
-                capabilities.health = EndpointAvailability::TemporarilyUnavailable;
-                let detail = describe_transport_error(&err);
-                let obs =
-                    RawObservation { unreachable: true, error: Some(detail), ..Default::default() };
-                return Ok(normalize(&obs));
-            }
-        };
-        capabilities.health = health_availability;
+        self.snapshot_due(capabilities, EndpointDue::ALL).await
+    }
 
-        let mut obs = RawObservation {
-            health: Some(health::HealthOutcome { server: outcome.server, detail: outcome.detail }),
-            ..Default::default()
-        };
-
-        // The remaining endpoints are independent; each degrades to None and
-        // re-observes its availability so temporary states recover without a
-        // manual reconnect. Unsupported / AuthenticationFailed endpoints are
-        // skipped on the regular cycle (re-probed on reconnect).
-        if capabilities.slots.needs_observation() {
-            let (observation, parsed) = self.fetch_endpoint("slots", slots::parse_slots).await;
-            capabilities.slots = observation;
-            obs.slots = parsed;
+    async fn snapshot_due(
+        &mut self,
+        capabilities: &mut BackendCapabilities,
+        due: EndpointDue,
+    ) -> Result<BackendSnapshot, BackendError> {
+        // Health is the authoritative reachability check. It is fetched when
+        // due, or whenever there is no successful observation yet: a
+        // connection state cannot be reported without one.
+        if due.health || self.last_health.is_none() {
+            match self.client.get_raw("health").await {
+                Ok((status, body, _)) => {
+                    let (availability, outcome) = health::classify_health(status, &body);
+                    capabilities.health = availability;
+                    self.last_health = Some(outcome);
+                }
+                Err(BackendError::Authentication) => {
+                    capabilities.health = EndpointAvailability::AuthenticationFailed;
+                    return Err(BackendError::Authentication);
+                }
+                Err(err) => {
+                    capabilities.health = EndpointAvailability::TemporarilyUnavailable;
+                    self.last_health = None;
+                    let detail = describe_transport_error(&err);
+                    let obs = RawObservation {
+                        unreachable: true,
+                        error: Some(detail),
+                        ..Default::default()
+                    };
+                    return Ok(normalize(&obs));
+                }
+            }
         }
 
-        if capabilities.metrics.needs_observation() {
+        let mut obs = RawObservation { health: self.last_health.clone(), ..Default::default() };
+
+        // Each remaining endpoint is fetched when due and when its
+        // observation allows regular fetching; a failure clears its cache
+        // (the data is missing, never guessed), and an endpoint that is not
+        // due keeps its last successful observation.
+        if due.slots && capabilities.slots.needs_observation() {
+            let (observation, parsed) = self.fetch_endpoint("slots", slots::parse_slots).await;
+            capabilities.slots = observation;
+            self.last_slots = parsed;
+        }
+        obs.slots = self.last_slots.clone();
+
+        if due.metrics && capabilities.metrics.needs_observation() {
             match self.client.get_raw("metrics").await {
                 Ok((status, body, _)) => {
                     let parsed = metrics::parse_metrics(&body);
                     let observation = capabilities::classify_response(status, &body, true);
                     capabilities.metrics = observation;
                     if observation.is_available() {
-                        obs.metrics = Some(parsed);
                         // The `Process-Start-Time-Unix` header is remembered
                         // on the client for restart detection.
-                        obs.server_start_unix = self.client.last_process_start_unix();
+                        self.last_metrics = Some(parsed);
                     } else {
+                        self.last_metrics = None;
                         warn!(status, "/metrics returned a non-usable status; skipping metrics");
                     }
                 }
                 Err(BackendError::BodyTooLarge { .. }) => {
                     capabilities.metrics = EndpointAvailability::ParseFailed;
+                    self.last_metrics = None;
                 }
                 Err(err) => {
                     capabilities.metrics = EndpointAvailability::TemporarilyUnavailable;
+                    self.last_metrics = None;
                     warn!(error = %err, "failed to fetch /metrics");
                 }
             }
         }
+        if let Some(m) = &self.last_metrics {
+            obs.metrics = Some(m.clone());
+            obs.server_start_unix = self.client.last_process_start_unix();
+        }
 
-        if capabilities.props.needs_observation() {
+        if due.props && capabilities.props.needs_observation() {
             let (observation, parsed) = self.fetch_endpoint("props", props::parse_props).await;
             capabilities.props = observation;
-            obs.props = parsed;
+            self.last_props = parsed;
         }
+        obs.props = self.last_props.clone();
 
         // Keep the derived capability flags in sync with the observations so
         // a stale probe and a recovered fetch agree.

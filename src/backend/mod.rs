@@ -96,6 +96,29 @@ impl EndpointAvailability {
     }
 }
 
+/// Which endpoints are due for a fetch in this cycle.
+///
+/// The scheduling decision lives in the collector (per-endpoint intervals);
+/// the backend only fetches what is marked due here and keeps its last
+/// successful observation for the endpoints that are not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointDue {
+    pub health: bool,
+    pub slots: bool,
+    pub metrics: bool,
+    pub props: bool,
+}
+
+impl EndpointDue {
+    /// Every endpoint due (initial cycle, manual reconnect).
+    pub const ALL: EndpointDue =
+        EndpointDue { health: true, slots: true, metrics: true, props: true };
+
+    /// Nothing due (defensive; a collector cycle always has at least one).
+    pub const NONE: EndpointDue =
+        EndpointDue { health: false, slots: false, metrics: false, props: false };
+}
+
 /// Health probe result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendHealth {
@@ -127,9 +150,31 @@ pub trait InferenceBackend: Send + Sync {
     /// is re-observed, so temporary failures and parse errors recover on a
     /// later snapshot without a manual reconnect. The caller keeps the same
     /// `BackendCapabilities` value across calls and passes it in mutably.
+    ///
+    /// Takes `&mut self` because the backend caches the last successful
+    /// observation per endpoint (shared with [`InferenceBackend::snapshot_due`]).
     async fn snapshot(
-        &self,
+        &mut self,
         capabilities: &mut BackendCapabilities,
+    ) -> Result<BackendSnapshot, BackendError>;
+
+    /// Capture a normalized snapshot fetching only the endpoints marked in
+    /// `due`.
+    ///
+    /// Contract:
+    /// - a due endpoint is fetched and its capability observation updated,
+    ///   exactly as in `snapshot`; a fetch failure degrades that endpoint's
+    ///   data to missing for this snapshot (never to a guessed value);
+    /// - an endpoint that is not due keeps its last successful observation
+    ///   (cached by the backend); its fields in the returned snapshot carry
+    ///   the previous values and its observation is left unchanged.
+    ///
+    /// The caller (the TUI collector) knows which endpoints were due and
+    /// uses that to decide which fields are fresh.
+    async fn snapshot_due(
+        &mut self,
+        capabilities: &mut BackendCapabilities,
+        due: EndpointDue,
     ) -> Result<BackendSnapshot, BackendError>;
 }
 

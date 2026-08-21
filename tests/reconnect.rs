@@ -4,9 +4,9 @@
 use std::time::{Duration, Instant};
 
 use llamatop::backend::llamacpp::LlamaCppBackend;
-use llamatop::backend::{BackendCapabilities, EndpointAvailability, InferenceBackend};
+use llamatop::backend::{BackendCapabilities, EndpointAvailability, EndpointDue, InferenceBackend};
 use llamatop::detector::StateDetector;
-use llamatop::domain::{ConnectionState, ServerState, WorkloadPhase};
+use llamatop::domain::{ConnectionState, ServerState, SlotPhase, SlotSnapshot, WorkloadPhase};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -52,7 +52,7 @@ async fn ready_server() -> MockServer {
 
 #[tokio::test]
 async fn unreachable_backend_yields_error_snapshot() {
-    let backend = dead_backend();
+    let mut backend = dead_backend();
     let mut caps = BackendCapabilities::default();
     let snap = backend.snapshot(&mut caps).await.unwrap();
     assert_eq!(snap.connection, ConnectionState::Error);
@@ -65,7 +65,7 @@ async fn unreachable_backend_yields_error_snapshot() {
 #[tokio::test]
 async fn single_failure_is_reconnecting_not_disconnected() {
     let mut detector = StateDetector::new();
-    let backend = dead_backend();
+    let mut backend = dead_backend();
     let mut caps = BackendCapabilities::default();
     let snap = backend.snapshot(&mut caps).await.unwrap();
     let out = detector.update(snap, Instant::now());
@@ -79,7 +79,7 @@ async fn recovery_resets_counters_and_reports_connected() {
 
     // 1. A healthy observation with counters already advanced.
     let server = ready_server().await;
-    let backend =
+    let mut backend =
         LlamaCppBackend::new(server.uri().as_str(), Duration::from_secs(2), None).unwrap();
     let mut caps = BackendCapabilities {
         health: EndpointAvailability::Available,
@@ -93,7 +93,7 @@ async fn recovery_resets_counters_and_reports_connected() {
     assert_eq!(out1.server, ServerState::Ready);
 
     // 2. The server goes away.
-    let dead = dead_backend();
+    let mut dead = dead_backend();
     let dead_snap = dead.snapshot(&mut caps).await.unwrap();
     let out2 = detector.update(dead_snap, Instant::now());
     assert_eq!(out2.connection, ConnectionState::Reconnecting);
@@ -150,7 +150,7 @@ async fn snapshot_recovers_temporarily_unavailable_endpoints() {
     // server is now healthy. A single snapshot must re-observe each
     // endpoint and recover it without a manual reconnect.
     let server = ready_server().await;
-    let backend =
+    let mut backend =
         LlamaCppBackend::new(server.uri().as_str(), Duration::from_secs(2), None).unwrap();
     let mut caps = BackendCapabilities {
         slots: EndpointAvailability::TemporarilyUnavailable,
@@ -185,7 +185,7 @@ async fn temporary_metrics_failure_is_not_metrics_disabled() {
         )
         .mount(&server)
         .await;
-    let backend =
+    let mut backend =
         LlamaCppBackend::new(server.uri().as_str(), Duration::from_secs(2), None).unwrap();
     // Previous good observation; the 503 must downgrade it to temporary.
     let mut caps =
@@ -214,7 +214,7 @@ async fn props_failure_does_not_become_an_empty_valid_model() {
         )
         .mount(&server)
         .await;
-    let backend =
+    let mut backend =
         LlamaCppBackend::new(server.uri().as_str(), Duration::from_secs(2), None).unwrap();
     // Previous good observation; the 500 must downgrade it to temporary.
     let mut caps =
@@ -223,4 +223,118 @@ async fn props_failure_does_not_become_an_empty_valid_model() {
     assert_eq!(caps.props, EndpointAvailability::TemporarilyUnavailable);
     assert_eq!(snap.model_name, None, "a failed /props must not fabricate a model");
     assert_eq!(snap.model_path, None);
+}
+
+#[tokio::test]
+async fn not_due_endpoint_keeps_its_last_successful_observation() {
+    // The scheduling decision (which endpoints are due) lives in the collector;
+    // the backend serves not-due endpoints from its value cache. A not-due
+    // endpoint must keep its last successful observation: not the new server
+    // data, and not a fake `None`.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("props"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"total_slots": 1})),
+        )
+        .mount(&server)
+        .await;
+    // Scoped: dropping the guard unmounts the mock (the server's /slots
+    // "changes" between the two cycles).
+    let slots_mock = Mock::given(method("GET"))
+        .and(path("slots"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": 1,
+                "n_ctx": 1024,
+                "is_processing": true,
+                "id_task": 100,
+                "n_prompt_tokens": 8,
+                "n_prompt_tokens_processed": 8,
+                "next_token": {"has_next_token": true, "has_new_line": false, "n_remain": -1, "n_decoded": 42}
+            }
+        ])))
+        .mount_as_scoped(&server)
+        .await;
+
+    let mut backend =
+        LlamaCppBackend::new(server.uri().as_str(), Duration::from_secs(2), None).unwrap();
+    let mut caps = BackendCapabilities::default();
+
+    // Cycle 1: everything is due -> /slots is fetched (42 decoded).
+    let first = backend.snapshot_due(&mut caps, EndpointDue::ALL).await.unwrap();
+    assert_eq!(first.slots.len(), 1);
+    assert_eq!(first.slots[0].n_decoded, Some(42));
+    assert_eq!(caps.slots, EndpointAvailability::Available);
+
+    // The server now reports a different task on /slots.
+    drop(slots_mock);
+    let _ = Mock::given(method("GET"))
+        .and(path("slots"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": 9, "is_processing": false}
+        ])))
+        .mount(&server)
+        .await;
+
+    // Cycle 2: only health is due -> the cached /slots observation is
+    // retained (the old task), and the slots observation is left unchanged.
+    let second = backend
+        .snapshot_due(&mut caps, EndpointDue { health: true, ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(second.slots.len(), 1);
+    assert_eq!(second.slots[0].id, 1, "not-due slots keep the previous observation");
+    assert_eq!(second.slots[0].n_decoded, Some(42));
+    assert_ne!(second.slots[0].id, 9, "not-due endpoints are not re-fetched");
+    assert_eq!(caps.slots, EndpointAvailability::Available, "not-due observation unchanged");
+}
+
+#[tokio::test]
+async fn not_due_observation_does_not_alter_rate_baselines() {
+    // Re-feeding the cached (unchanged) slots observation must not shift the
+    // detector's baselines or phase: identical values yield a zero rate (not
+    // a fabricated delta) and a stable phase.
+    let mut detector = StateDetector::new();
+    let slot = SlotSnapshot {
+        id: 1,
+        task_id: Some(100),
+        is_processing: true,
+        n_ctx: Some(1024),
+        n_tokens: Some(50),
+        n_prompt_tokens: Some(8),
+        n_prompt_tokens_processed: Some(8),
+        n_decoded: Some(42),
+        speculative: false,
+        phase: SlotPhase::Idle,
+    };
+    let snap = llamatop::domain::BackendSnapshot {
+        connection: ConnectionState::Connected,
+        server: ServerState::Ready,
+        prompt_tokens_total: Some(100),
+        generation_tokens_total: Some(50),
+        slots: vec![slot.clone()],
+        ..Default::default()
+    };
+
+    let base = Instant::now();
+    detector.update(snap.clone(), base);
+    let out2 = detector.update(snap.clone(), base + Duration::from_secs(1));
+    let out3 = detector.update(snap, base + Duration::from_secs(2));
+
+    assert_eq!(
+        out2.workload_phase, out3.workload_phase,
+        "a repeated unchanged observation must not move the phase"
+    );
+    assert_eq!(
+        out2.generation_tokens_per_second,
+        Some(0.0),
+        "unchanged counters yield a zero rate, not a fabricated delta"
+    );
+    assert_eq!(out3.generation_tokens_per_second, Some(0.0));
 }

@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::domain::ServerState;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthOutcome {
     pub server: ServerState,
     /// Short reason when not ready.

@@ -235,13 +235,18 @@ impl Doctor {
             (None, _) => checks.push(Check::ok("Authentication not required")),
         }
 
-        // GPU: NVML initialization + device enumeration.
-        match self.gpu_checks() {
-            Ok(gpu_checks) => checks.extend(gpu_checks),
-            Err(_) => {
-                // gpu_checks returns Err only if NVML init itself failed.
-                checks.push(Check::warning("NVIDIA NVML unavailable"));
+        // GPU: NVML initialization + device enumeration, unless the user
+        // disabled GPU monitoring (--no-gpu or gpu.backend = "none").
+        if self.config.show_gpu && self.config.gpu.backend != "none" {
+            match self.gpu_checks() {
+                Ok(gpu_checks) => checks.extend(gpu_checks),
+                Err(_) => {
+                    // gpu_checks returns Err only if NVML init itself failed.
+                    checks.push(Check::warning("NVIDIA NVML unavailable"));
+                }
             }
+        } else {
+            checks.push(Check::ok("GPU monitoring disabled"));
         }
 
         // Terminal size. When output is not a TTY there is no interactive

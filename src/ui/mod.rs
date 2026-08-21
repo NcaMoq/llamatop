@@ -459,12 +459,12 @@ mod tests {
         }
     }
 
-    /// Connected/ready state with the /slots capability enabled.
+    /// Connected/ready state with /slots and /metrics available.
     fn connected_slots(overrides: impl FnOnce(&mut BackendSnapshot)) -> AppState {
         let mut state = connected_ready(overrides);
         state.apply_capabilities(crate::backend::BackendCapabilities {
-            slots: true,
-            metrics: true,
+            slots: crate::backend::EndpointAvailability::Available,
+            metrics: crate::backend::EndpointAvailability::Available,
             ..Default::default()
         });
         state
@@ -487,23 +487,120 @@ mod tests {
         rows
     }
 
+    /// A connected state with a given /slots observation.
+    fn state_with_slots_observation(state: crate::backend::EndpointAvailability) -> AppState {
+        let mut s = connected_ready(|_| {});
+        s.apply_capabilities(crate::backend::BackendCapabilities {
+            slots: state,
+            ..Default::default()
+        });
+        s
+    }
+
     #[test]
-    fn slots_unavailable_view_when_endpoint_missing() {
-        // Default capabilities: /slots not probed/available.
+    fn slots_unsupported_view_when_endpoint_missing() {
+        let state = state_with_slots_observation(crate::backend::EndpointAvailability::Unsupported);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Slots unsupported"));
+        assert!(content.contains("--no-slots"));
+        // Distinct from the zero-slots view and from a temporary failure.
+        assert!(!content.contains("No slots reported"));
+        assert!(!content.contains("temporarily unavailable"));
+    }
+
+    #[test]
+    fn slots_temporarily_unavailable_view_is_distinct() {
+        let state = state_with_slots_observation(
+            crate::backend::EndpointAvailability::TemporarilyUnavailable,
+        );
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Slots temporarily unavailable"));
+        assert!(!content.contains("Slots unsupported"));
+        // A temporary failure is never "no slots reported": the data is
+        // missing, not empty.
+        assert!(!content.contains("No slots reported"));
+    }
+
+    #[test]
+    fn slots_parse_failed_view_is_distinct() {
+        let state = state_with_slots_observation(crate::backend::EndpointAvailability::ParseFailed);
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Slots response could not be parsed"));
+        assert!(!content.contains("Slots unsupported"));
+        assert!(!content.contains("No slots reported"));
+    }
+
+    #[test]
+    fn slots_authentication_failed_view_is_distinct() {
+        let state = state_with_slots_observation(
+            crate::backend::EndpointAvailability::AuthenticationFailed,
+        );
+        let content = render_content(&state, false, 80, 20);
+        assert!(content.contains("Slots authentication failed"));
+        assert!(content.contains("API key"));
+        assert!(!content.contains("No slots reported"));
+    }
+
+    #[test]
+    fn slots_unknown_view_before_any_observation() {
+        // Default capabilities: /slots has never been observed.
         let state = connected_ready(|_| {});
         let content = render_content(&state, false, 80, 20);
         assert!(content.contains("Slots unavailable"));
-        assert!(content.contains("Per-slot monitoring will not be available."));
-        // Distinct from the zero-slots view.
+        assert!(!content.contains("Slots unsupported"));
         assert!(!content.contains("No slots reported"));
     }
 
     #[test]
     fn no_slots_reported_view_when_empty() {
-        let state = connected_slots(|_| {}); // capability on, zero slots
+        let state = connected_slots(|_| {}); // /slots available, zero slots
         let content = render_content(&state, false, 80, 20);
         assert!(content.contains("No slots reported"));
         assert!(!content.contains("Slots unavailable"));
+        assert!(!content.contains("Slots unsupported"));
+        assert!(!content.contains("could not be parsed"));
+    }
+
+    /// A connected state with a given /metrics observation.
+    fn state_with_metrics_observation(state: crate::backend::EndpointAvailability) -> AppState {
+        let mut s = connected_ready(|_| {});
+        s.apply_capabilities(crate::backend::BackendCapabilities {
+            metrics: state,
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn metrics_warning_shows_the_specific_state() {
+        // Unsupported (server started without --metrics):
+        let content = render_content(
+            &state_with_metrics_observation(crate::backend::EndpointAvailability::Unsupported),
+            false,
+            80,
+            20,
+        );
+        assert!(content.contains("Metrics endpoint not supported by the server"));
+        assert!(content.contains("--metrics"));
+        // Parse failure is a different message:
+        let content = render_content(
+            &state_with_metrics_observation(crate::backend::EndpointAvailability::ParseFailed),
+            false,
+            80,
+            20,
+        );
+        assert!(content.contains("Metrics response could not be parsed"));
+        assert!(!content.contains("not supported by the server"));
+        // An available /metrics renders no warning at all:
+        let content = render_content(
+            &state_with_metrics_observation(crate::backend::EndpointAvailability::Available),
+            false,
+            80,
+            20,
+        );
+        assert!(!content.contains("Metrics temporarily unavailable"));
+        assert!(!content.contains("Metrics endpoint not supported"));
+        assert!(!content.contains("Metrics response could not be parsed"));
     }
 
     #[test]
@@ -1019,12 +1116,12 @@ mod tests {
             s.slots = vec![slot(137, true, Some(8_192))];
         });
         state.apply_capabilities(crate::backend::BackendCapabilities {
-            slots: true,
-            metrics: false,
+            slots: crate::backend::EndpointAvailability::Available,
+            metrics: crate::backend::EndpointAvailability::TemporarilyUnavailable,
             ..Default::default()
         });
         let content = render_content(&state, false, 80, 20);
-        assert!(content.contains("Metrics unavailable"), "warning must render");
+        assert!(content.contains("Metrics temporarily unavailable"), "warning must render");
         assert!(!content.contains("Slots unavailable"), "capability is on");
         let lines = split_rows(&content, 80);
         assert!(

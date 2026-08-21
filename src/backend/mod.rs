@@ -12,21 +12,88 @@ use crate::error::BackendError;
 
 /// Which API endpoints a backend instance supports.
 ///
-/// Probed at connect time and re-probed after a reconnect. Endpoints may be
-/// individually disabled by the server (e.g. `--no-slots`, no `--metrics`);
-/// a missing endpoint must never terminate the application.
+/// Probed at connect time, re-probed after a reconnect, and re-observed on
+/// every snapshot so that temporary failures are visible and recover
+/// automatically. Endpoints may be individually disabled by the server
+/// (e.g. `--no-slots`, no `--metrics`); a missing endpoint must never
+/// terminate the application.
+///
+/// Each optional endpoint carries an [`EndpointAvailability`] observation,
+/// not a `bool`: "the server answered 501" (unsupported) is a different fact
+/// from "the server timed out" (temporarily unavailable) and from "never
+/// probed" (unknown).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackendCapabilities {
-    pub health: bool,
-    pub slots: bool,
-    pub metrics: bool,
-    pub props: bool,
+    pub health: EndpointAvailability,
+    pub slots: EndpointAvailability,
+    pub metrics: EndpointAvailability,
+    pub props: EndpointAvailability,
     pub model_info: bool,
     pub speculative_metrics: bool,
     /// The backend exposes a direct prefill/processing signal (exact phase).
     pub exact_prefill_state: bool,
     /// The backend exposes a direct decode signal (e.g. per-slot decoded growth).
     pub exact_decode_state: bool,
+}
+
+/// The observed availability of one endpoint.
+///
+/// These are *observations*, not capabilities: `Available` means "the last
+/// observation showed a usable answer", `Unknown` means "we have no
+/// observation yet". The collector re-observes so states recover without a
+/// manual reconnect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EndpointAvailability {
+    /// No observation yet (never probed, or the probe could not run because
+    /// the server was unreachable).
+    #[default]
+    Unknown,
+    /// The endpoint answered with a usable, expected response.
+    Available,
+    /// The server answered and this endpoint does not exist on it (404/405,
+    /// or 501 where the server reports "disabled by configuration").
+    /// Re-validated only slowly; a manual reconnect re-probes it.
+    Unsupported,
+    /// A transport-level or server error (timeout, connection refused, DNS,
+    /// 5xx). Retried automatically on the next observation.
+    TemporarilyUnavailable,
+    /// The server rejected the credentials (401/403). Retried only slowly;
+    /// a manual reconnect re-probes it.
+    AuthenticationFailed,
+    /// The endpoint answered 2xx but the body was not the expected payload.
+    /// Retried on the next observation.
+    ParseFailed,
+}
+
+impl EndpointAvailability {
+    /// True only for `Available`: the only state in which the endpoint's
+    /// data can be trusted as current.
+    pub fn is_available(&self) -> bool {
+        matches!(self, EndpointAvailability::Available)
+    }
+
+    /// True when the endpoint should be (re-)fetched now: it is known
+    /// available, or there is no usable observation yet (unknown, temporary
+    /// failure, or a stale parse failure). `Unsupported` and
+    /// `AuthenticationFailed` are not fetched on the regular cycle.
+    pub fn needs_observation(&self) -> bool {
+        !matches!(
+            self,
+            EndpointAvailability::Unsupported | EndpointAvailability::AuthenticationFailed
+        )
+    }
+
+    /// Short, stable label for UI display (no color-only distinction).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EndpointAvailability::Unknown => "unknown",
+            EndpointAvailability::Available => "available",
+            EndpointAvailability::Unsupported => "unsupported",
+            EndpointAvailability::TemporarilyUnavailable => "temporarily unavailable",
+            EndpointAvailability::AuthenticationFailed => "authentication failed",
+            EndpointAvailability::ParseFailed => "parse failed",
+        }
+    }
 }
 
 /// Health probe result.
@@ -54,9 +121,15 @@ pub trait InferenceBackend: Send + Sync {
     ///
     /// Missing optional endpoints degrade the snapshot (fields stay `None`);
     /// they do not produce an error for the whole snapshot.
+    ///
+    /// The capability observations are *updated* by this call: every
+    /// endpoint that is fetched (see [`EndpointAvailability::needs_observation`])
+    /// is re-observed, so temporary failures and parse errors recover on a
+    /// later snapshot without a manual reconnect. The caller keeps the same
+    /// `BackendCapabilities` value across calls and passes it in mutably.
     async fn snapshot(
         &self,
-        capabilities: &BackendCapabilities,
+        capabilities: &mut BackendCapabilities,
     ) -> Result<BackendSnapshot, BackendError>;
 }
 

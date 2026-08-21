@@ -40,6 +40,12 @@ pub enum EventKind {
     WorkloadPhaseChanged,
     MetricsUnavailable,
     SlotsUnavailable,
+    /// An endpoint observation changed (availability, unsupported, parse
+    /// failure, authentication). One variant per endpoint so the log shows
+    /// which endpoint changed.
+    MetricsAvailabilityChanged,
+    SlotsAvailabilityChanged,
+    PropsAvailabilityChanged,
     ManualReconnect,
     PauseChanged,
     HistoryCleared,

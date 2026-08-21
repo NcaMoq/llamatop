@@ -18,6 +18,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::history::HistorySample;
 use crate::app::log::{EventRecord, EventSeverity};
 use crate::app::state::AppState;
+use crate::backend::EndpointAvailability;
 use crate::display::Symbols;
 use crate::domain::{
     BackendSnapshot, Confidence, ConnectionState, GpuMonitorStatus, GpuSnapshot,
@@ -331,10 +332,32 @@ fn render_inference(f: &mut Frame, area: Rect, snap: &BackendSnapshot, symbols: 
 /// by `render_status` (to draw them).
 fn status_lines(state: &AppState, symbols: &Symbols) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    if !state.capabilities.metrics {
-        lines.push(format!("{} Metrics unavailable", symbols.warning()));
-        lines.push("Throughput values cannot be displayed.".into());
-        lines.push("Start llama-server with --metrics.".into());
+    // The /metrics observation renders a state-specific warning: "disabled
+    // by the server" is a different fact from "the server is busy" and from
+    // "the body cannot be parsed", so each gets its own message.
+    if let Some((title, hint)) = match state.capabilities.metrics {
+        EndpointAvailability::Available => None,
+        EndpointAvailability::Unsupported => Some((
+            "Metrics endpoint not supported by the server",
+            "Start llama-server with --metrics.",
+        )),
+        EndpointAvailability::TemporarilyUnavailable => Some((
+            "Metrics temporarily unavailable",
+            "Throughput values will return when the server responds.",
+        )),
+        EndpointAvailability::ParseFailed => {
+            Some(("Metrics response could not be parsed", "Throughput values cannot be displayed."))
+        }
+        EndpointAvailability::AuthenticationFailed => {
+            Some(("Metrics authentication failed", "Check the API key environment variable."))
+        }
+        EndpointAvailability::Unknown => Some((
+            "Metrics endpoint not probed yet",
+            "Throughput values will return when the server responds.",
+        )),
+    } {
+        lines.push(format!("{} {}", symbols.warning(), title));
+        lines.push(hint.into());
     }
     if let Some(msg) = &state.connection_message {
         if !lines.is_empty() {
@@ -863,11 +886,34 @@ fn render_slots(f: &mut Frame, area: Rect, state: &AppState, symbols: &Symbols) 
         return;
     }
 
-    if !state.capabilities.slots {
-        // /slots endpoint absent — distinct from "zero slots reported".
+    // The /slots observation renders a state-specific message. Each
+    // non-available state is a different fact (disabled vs. busy vs.
+    // unparseable vs. auth) and gets its own text; none of them is "No
+    // slots reported", which means /slots succeeded and returned zero slots.
+    if let Some((title, detail)) = match state.capabilities.slots {
+        EndpointAvailability::Available => None,
+        EndpointAvailability::Unsupported => Some((
+            "Slots unsupported",
+            "The server does not expose /slots (for example --no-slots).",
+        )),
+        EndpointAvailability::TemporarilyUnavailable => Some((
+            "Slots temporarily unavailable",
+            "Per-slot monitoring will return when the server responds.",
+        )),
+        EndpointAvailability::ParseFailed => Some((
+            "Slots response could not be parsed",
+            "Per-slot monitoring will return when the server responds.",
+        )),
+        EndpointAvailability::AuthenticationFailed => {
+            Some(("Slots authentication failed", "Check the API key environment variable."))
+        }
+        EndpointAvailability::Unknown => {
+            Some(("Slots unavailable", "Waiting for the first observation."))
+        }
+    } {
         let text = Paragraph::new(vec![
-            Line::from(format!("{} Slots unavailable", symbols.warning())),
-            Line::from("Per-slot monitoring will not be available."),
+            Line::from(format!("{} {}", symbols.warning(), title)),
+            Line::from(detail),
         ]);
         f.render_widget(text, inner);
         return;

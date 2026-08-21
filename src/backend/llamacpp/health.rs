@@ -57,6 +57,26 @@ pub fn parse_health(status: u16, body: &str) -> HealthOutcome {
     }
 }
 
+/// Classify a raw `/health` response as an endpoint observation.
+///
+/// 200 is the only "usable" answer (`Available`); everything else is a
+/// temporary state that the next snapshot re-observes: 503 is the canonical
+/// "model loading" signal, 401/403 are credential rejections, and other
+/// 4xx/5xx (e.g. a proxy 404) are transient from the endpoint's point of
+/// view.
+pub fn classify_health(
+    status: u16,
+    body: &str,
+) -> (crate::backend::EndpointAvailability, HealthOutcome) {
+    let outcome = parse_health(status, body);
+    let availability = match status {
+        200 => crate::backend::EndpointAvailability::Available,
+        401 | 403 => crate::backend::EndpointAvailability::AuthenticationFailed,
+        _ => crate::backend::EndpointAvailability::TemporarilyUnavailable,
+    };
+    (availability, outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +137,47 @@ mod tests {
         let out = parse_health(503, "gateway said no");
         assert_eq!(out.server, ServerState::Loading);
         assert_eq!(out.detail.as_deref(), Some("HTTP 503"));
+    }
+
+    // --- classify_health ---
+
+    use crate::backend::EndpointAvailability;
+
+    #[test]
+    fn health_200_is_available() {
+        let (avail, out) = classify_health(200, r#"{"status":"ok"}"#);
+        assert_eq!(avail, EndpointAvailability::Available);
+        assert_eq!(out.server, ServerState::Ready);
+    }
+
+    #[test]
+    fn health_503_is_temporarily_unavailable_while_loading() {
+        let body = r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#;
+        let (avail, out) = classify_health(503, body);
+        assert_eq!(avail, EndpointAvailability::TemporarilyUnavailable);
+        assert_eq!(out.server, ServerState::Loading);
+    }
+
+    #[test]
+    fn health_401_is_authentication_failed() {
+        let (avail, out) = classify_health(401, r#"{"error":"unauthorized"}"#);
+        assert_eq!(avail, EndpointAvailability::AuthenticationFailed);
+        assert_eq!(out.server, ServerState::Unavailable);
+    }
+
+    #[test]
+    fn health_403_is_authentication_failed() {
+        let (avail, _) = classify_health(403, r#"{"error":"forbidden"}"#);
+        assert_eq!(avail, EndpointAvailability::AuthenticationFailed);
+    }
+
+    #[test]
+    fn health_other_4xx_and_5xx_are_temporarily_unavailable() {
+        // A proxy 404 on /health is not evidence the endpoint is disabled;
+        // it is retried on the next observation.
+        let (avail404, _) = classify_health(404, r#"{"error":"not found"}"#);
+        assert_eq!(avail404, EndpointAvailability::TemporarilyUnavailable);
+        let (avail502, _) = classify_health(502, r#"{"error":"bad gateway"}"#);
+        assert_eq!(avail502, EndpointAvailability::TemporarilyUnavailable);
     }
 }

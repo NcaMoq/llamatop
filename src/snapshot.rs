@@ -59,18 +59,20 @@ pub async fn capture(config: &Config) -> anyhow::Result<Snapshot> {
 
     // Probe capabilities; if the server is unreachable the probe fails and we
     // fall through with default (all-unknown) capabilities. The snapshot
-    // call below reports the transport failure in the domain snapshot.
-    let capabilities = backend.probe_capabilities().await.unwrap_or_default();
+    // call below reports the transport failure in the domain snapshot. The
+    // snapshots re-observe endpoint availability in place, so a probe that
+    // saw a transient failure recovers within this single capture.
+    let mut capabilities = backend.probe_capabilities().await.unwrap_or_default();
 
     let mut detector = StateDetector::new();
 
-    let first = backend.snapshot(&capabilities).await.unwrap_or_default();
+    let first = backend.snapshot(&mut capabilities).await.unwrap_or_default();
     detector.update(first, Instant::now());
 
     // A short, bounded wait so the second observation yields a real delta.
     tokio::time::sleep(sample_interval(config)).await;
 
-    let second = backend.snapshot(&capabilities).await.unwrap_or_default();
+    let second = backend.snapshot(&mut capabilities).await.unwrap_or_default();
     let stabilized = detector.update(second, Instant::now());
 
     Ok(Snapshot {

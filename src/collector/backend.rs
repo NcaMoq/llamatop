@@ -50,8 +50,14 @@ pub async fn run(
     loop {
         // Fetch now, then wait for the next cycle or a command. Because the
         // fetch precedes the wait, a Reconnect command triggers an immediate
-        // fetch on the next iteration.
-        fetch_once(&backend, &capabilities, &mut detector, &events).await;
+        // fetch on the next iteration. The fetch re-observes endpoint
+        // availability in place, so temporary states recover here; an
+        // observation that changed is forwarded so the UI stays accurate.
+        let before = capabilities;
+        fetch_once(&backend, &mut capabilities, &mut detector, &events).await;
+        if capabilities != before {
+            let _ = events.send(AppEvent::BackendCapabilities(capabilities));
+        }
 
         tokio::select! {
             command = commands.recv() => {
@@ -80,7 +86,7 @@ pub async fn run(
 /// Disconnected) keeps working during outages.
 async fn fetch_once(
     backend: &LlamaCppBackend,
-    capabilities: &BackendCapabilities,
+    capabilities: &mut BackendCapabilities,
     detector: &mut StateDetector,
     events: &UnboundedSender<AppEvent>,
 ) {

@@ -39,13 +39,35 @@ pub struct RawDefaultSettings {
 }
 
 /// Parse a `/props` body. Unknown fields are ignored.
+///
+/// The top-level value must be a JSON object: serde would otherwise accept
+/// other shapes (e.g. `[]`) and fall back to `RawProps::default()`, which
+/// would make a malformed response look like a valid model with no fields.
 pub fn parse_props(body: &str) -> Result<RawProps, String> {
-    serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    match value {
+        serde_json::Value::Object(_) => {
+            serde_json::from_value(value).map_err(|e| format!("invalid JSON: {e}"))
+        }
+        _ => Err("expected a JSON object".to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_body_is_an_error() {
+        // A JSON array is not a props object: it must be rejected, otherwise
+        // a 200 "[]" would look like a valid (empty) model.
+        let err = parse_props("[]").expect_err("an array body is not a props object");
+        assert_eq!(err, "expected a JSON object");
+        // A scalar is rejected the same way.
+        assert!(parse_props("42").is_err());
+        assert!(parse_props("null").is_err());
+    }
 
     #[test]
     fn parses_current_props_shape() {

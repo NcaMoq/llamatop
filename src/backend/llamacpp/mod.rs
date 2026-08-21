@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tracing::warn;
 
-use super::{BackendCapabilities, BackendHealth, InferenceBackend};
+use super::{BackendCapabilities, BackendHealth, EndpointAvailability, InferenceBackend};
 use crate::domain::BackendSnapshot;
 use crate::error::BackendError;
 
@@ -49,25 +49,38 @@ impl LlamaCppBackend {
         &self.client
     }
 
-    /// Fetch and parse one endpoint, returning `None` when the endpoint is
-    /// disabled (501/404) or the body cannot be parsed (logged, not fatal).
-    async fn fetch_json<T>(&self, path: &str, parse: fn(&str) -> Result<T, String>) -> Option<T> {
+    /// Fetch, classify, and parse one endpoint.
+    ///
+    /// Returns `(observation, parsed)` — `parsed` is `Some` only when the
+    /// observation is `Available`. The observation is an
+    /// [`EndpointAvailability`] so the caller can record *why* an endpoint
+    /// is missing data (disabled vs. busy vs. unparseable vs. auth), not
+    /// just that it is.
+    async fn fetch_endpoint<T>(
+        &self,
+        path: &str,
+        parse: fn(&str) -> Result<T, String>,
+    ) -> (EndpointAvailability, Option<T>) {
         match self.client.get_raw(path).await {
-            Ok((200, body, _)) => match parse(&body) {
-                Ok(value) => Some(value),
-                Err(detail) => {
-                    warn!(path, "failed to parse {path} response: {detail}");
-                    None
+            Ok((status, body, _)) => {
+                let parsed = parse(&body);
+                let observation = capabilities::classify_response(status, &body, parsed.is_ok());
+                match (observation, parsed) {
+                    (EndpointAvailability::Available, Ok(value)) => (observation, Some(value)),
+                    (EndpointAvailability::ParseFailed, Err(detail)) => {
+                        warn!(path, "failed to parse {path} response: {detail}");
+                        (observation, None)
+                    }
+                    (observation, _) => (observation, None),
                 }
-            },
-            Ok((status, _, _)) => {
-                // Endpoint exists but is disabled (501) or in an error state.
-                warn!(status, "endpoint {path} not usable");
-                None
+            }
+            Err(BackendError::BodyTooLarge { .. }) => {
+                warn!(path, "{path} response exceeded the body limit");
+                (EndpointAvailability::ParseFailed, None)
             }
             Err(err) => {
                 warn!(path, "failed to fetch {path}: {err}");
-                None
+                (EndpointAvailability::TemporarilyUnavailable, None)
             }
         }
     }
@@ -94,45 +107,78 @@ impl InferenceBackend for LlamaCppBackend {
 
     async fn snapshot(
         &self,
-        capabilities: &BackendCapabilities,
+        capabilities: &mut BackendCapabilities,
     ) -> Result<BackendSnapshot, BackendError> {
-        // Health is the authoritative reachability check.
-        let health = match self.health().await {
-            Ok(h) => Some(health::HealthOutcome { server: h.server, detail: h.detail }),
-            Err(BackendError::Authentication) => return Err(BackendError::Authentication),
+        // Health is the authoritative reachability check and is re-observed
+        // every snapshot regardless of its previous state: it doubles as the
+        // connection heartbeat.
+        let (health_availability, outcome) = match self.client.get_raw("health").await {
+            Ok((status, body, _)) => health::classify_health(status, &body),
+            Err(BackendError::Authentication) => {
+                capabilities.health = EndpointAvailability::AuthenticationFailed;
+                return Err(BackendError::Authentication);
+            }
             Err(err) => {
+                capabilities.health = EndpointAvailability::TemporarilyUnavailable;
                 let detail = describe_transport_error(&err);
                 let obs =
                     RawObservation { unreachable: true, error: Some(detail), ..Default::default() };
                 return Ok(normalize(&obs));
             }
         };
+        capabilities.health = health_availability;
 
-        let mut obs = RawObservation { health, ..Default::default() };
+        let mut obs = RawObservation {
+            health: Some(health::HealthOutcome { server: outcome.server, detail: outcome.detail }),
+            ..Default::default()
+        };
 
-        // The remaining endpoints are independent; each degrades to None.
-        if capabilities.slots {
-            obs.slots = self.fetch_json("slots", slots::parse_slots).await;
+        // The remaining endpoints are independent; each degrades to None and
+        // re-observes its availability so temporary states recover without a
+        // manual reconnect. Unsupported / AuthenticationFailed endpoints are
+        // skipped on the regular cycle (re-probed on reconnect).
+        if capabilities.slots.needs_observation() {
+            let (observation, parsed) = self.fetch_endpoint("slots", slots::parse_slots).await;
+            capabilities.slots = observation;
+            obs.slots = parsed;
         }
 
-        if capabilities.metrics {
+        if capabilities.metrics.needs_observation() {
             match self.client.get_raw("metrics").await {
-                Ok((200, body, start)) => {
-                    obs.metrics = Some(metrics::parse_metrics(&body));
-                    obs.server_start_unix = start.or_else(|| self.client.last_process_start_unix());
+                Ok((status, body, _)) => {
+                    let parsed = metrics::parse_metrics(&body);
+                    let observation = capabilities::classify_response(status, &body, true);
+                    capabilities.metrics = observation;
+                    if observation.is_available() {
+                        obs.metrics = Some(parsed);
+                        // The `Process-Start-Time-Unix` header is remembered
+                        // on the client for restart detection.
+                        obs.server_start_unix = self.client.last_process_start_unix();
+                    } else {
+                        warn!(status, "/metrics returned a non-usable status; skipping metrics");
+                    }
                 }
-                Ok((status, _, _)) => {
-                    warn!(status, "/metrics returned a non-200 status; skipping metrics");
+                Err(BackendError::BodyTooLarge { .. }) => {
+                    capabilities.metrics = EndpointAvailability::ParseFailed;
                 }
                 Err(err) => {
+                    capabilities.metrics = EndpointAvailability::TemporarilyUnavailable;
                     warn!(error = %err, "failed to fetch /metrics");
                 }
             }
         }
 
-        if capabilities.props {
-            obs.props = self.fetch_json("props", props::parse_props).await;
+        if capabilities.props.needs_observation() {
+            let (observation, parsed) = self.fetch_endpoint("props", props::parse_props).await;
+            capabilities.props = observation;
+            obs.props = parsed;
         }
+
+        // Keep the derived capability flags in sync with the observations so
+        // a stale probe and a recovered fetch agree.
+        capabilities.model_info = capabilities.props.is_available();
+        capabilities.speculative_metrics = capabilities.metrics.is_available();
+        capabilities.exact_decode_state = capabilities.slots.is_available();
 
         Ok(normalize(&obs))
     }

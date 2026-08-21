@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::app::event::{BackendErrorSummary, InputAction};
 use crate::app::history::History;
 use crate::app::log::{EventKind, EventLog, EventSeverity};
-use crate::backend::BackendCapabilities;
+use crate::backend::{BackendCapabilities, EndpointAvailability};
 use crate::config::Config;
 use crate::domain::{
     BackendSnapshot, ConnectionState, GpuMonitor, GpuMonitorStatus, SlotSnapshot, SystemSnapshot,
@@ -165,10 +165,12 @@ impl AppState {
         slots
     }
 
-    /// Whether slot selection is available: the /slots endpoint must work
-    /// and at least one slot must be visible (frozen while paused).
+    /// Whether slot selection is available: the /slots endpoint must have an
+    /// `Available` observation and at least one slot must be visible (frozen
+    /// while paused). Any other observation (unsupported, temporary, parse
+    /// failure, auth failure, unknown) keeps selection inert.
     pub fn can_select_slot(&self) -> bool {
-        self.capabilities.slots && !self.visible_slots().is_empty()
+        self.capabilities.slots.is_available() && !self.visible_slots().is_empty()
     }
 
     /// Minimum scroll offset that keeps the selected row inside a viewport
@@ -490,17 +492,72 @@ impl AppState {
     }
 
     /// Apply a capabilities update.
+    ///
+    /// An event is logged only for an endpoint whose *observation* changed
+    /// (steady states do not spam the log on every poll). The health
+    /// observation is intentionally not logged here: its transitions are the
+    /// server-state changes already recorded as `ServerStateChanged`.
     pub fn apply_capabilities(&mut self, caps: BackendCapabilities) {
-        if caps != self.capabilities {
-            self.log(EventSeverity::Info, EventKind::MetricsUnavailable, "Capabilities changed");
+        let prev = self.capabilities;
+        if caps.metrics != prev.metrics {
+            self.log_capability_change(
+                "metrics",
+                caps.metrics,
+                EventKind::MetricsAvailabilityChanged,
+            );
         }
-        if !caps.metrics {
-            self.log(EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable");
+        if caps.slots != prev.slots {
+            self.log_capability_change("slots", caps.slots, EventKind::SlotsAvailabilityChanged);
         }
-        if !caps.slots {
-            self.log(EventSeverity::Warning, EventKind::SlotsUnavailable, "Slots unavailable");
+        if caps.props != prev.props {
+            self.log_capability_change("props", caps.props, EventKind::PropsAvailabilityChanged);
         }
         self.capabilities = caps;
+    }
+
+    /// Log one endpoint observation change with the state-specific message.
+    fn log_capability_change(
+        &mut self,
+        endpoint: &str,
+        state: EndpointAvailability,
+        kind: EventKind,
+    ) {
+        match state {
+            EndpointAvailability::Available => {
+                self.log(EventSeverity::Info, kind, format!("{endpoint} endpoint available"));
+            }
+            EndpointAvailability::Unsupported => {
+                self.log(
+                    EventSeverity::Warning,
+                    kind,
+                    format!("{endpoint} endpoint is not supported by the server"),
+                );
+            }
+            EndpointAvailability::TemporarilyUnavailable => {
+                self.log(
+                    EventSeverity::Warning,
+                    kind,
+                    format!("{endpoint} endpoint temporarily unavailable"),
+                );
+            }
+            EndpointAvailability::AuthenticationFailed => {
+                self.log(
+                    EventSeverity::Error,
+                    kind,
+                    format!("{endpoint} endpoint authentication failed"),
+                );
+            }
+            EndpointAvailability::ParseFailed => {
+                self.log(
+                    EventSeverity::Warning,
+                    kind,
+                    format!("{endpoint} endpoint response could not be parsed"),
+                );
+            }
+            EndpointAvailability::Unknown => {
+                self.log(EventSeverity::Info, kind, format!("{endpoint} endpoint status unknown"));
+            }
+        }
     }
 
     /// Apply a backend error summary.
@@ -643,7 +700,7 @@ mod tests {
     fn state_with_slots(ids: &[u32]) -> AppState {
         let mut s = AppState::new(&config());
         s.apply_capabilities(crate::backend::BackendCapabilities {
-            slots: true,
+            slots: EndpointAvailability::Available,
             ..Default::default()
         });
         let mut snap = snapshot(ConnectionState::Connected, None);
@@ -1030,7 +1087,7 @@ mod tests {
         let mut s = AppState::new(&config());
         // Slot navigation only applies when the /slots endpoint is available.
         s.apply_capabilities(crate::backend::BackendCapabilities {
-            slots: true,
+            slots: EndpointAvailability::Available,
             ..Default::default()
         });
         let mut with_slots = snapshot(ConnectionState::Connected, None);
@@ -1086,12 +1143,65 @@ mod tests {
 
         // Enabling the capability activates selection on the same data.
         s.apply_capabilities(crate::backend::BackendCapabilities {
-            slots: true,
+            slots: EndpointAvailability::Available,
             ..Default::default()
         });
         assert!(s.can_select_slot());
         s.handle_input(InputAction::SlotDown);
         assert_eq!(s.selected_slot, 1);
+    }
+
+    #[test]
+    fn capability_changes_log_per_endpoint_events() {
+        let mut s = AppState::new(&config());
+        // The first probe: slots unsupported, metrics temporary, props
+        // unparseable. One event per changed endpoint, in a fixed order.
+        let first = crate::backend::BackendCapabilities {
+            slots: EndpointAvailability::Unsupported,
+            metrics: EndpointAvailability::TemporarilyUnavailable,
+            props: EndpointAvailability::ParseFailed,
+            ..Default::default()
+        };
+        s.apply_capabilities(first);
+        let kinds: Vec<EventKind> = s.events.records().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::MetricsAvailabilityChanged,
+                EventKind::SlotsAvailabilityChanged,
+                EventKind::PropsAvailabilityChanged
+            ]
+        );
+        // Re-applying the same observations must not add events (no per-poll
+        // spam).
+        s.apply_capabilities(first);
+        assert_eq!(s.events.len(), 3, "steady states must not spam the log");
+        // Recovery to Available logs exactly one info event.
+        let recovered = crate::backend::BackendCapabilities {
+            slots: EndpointAvailability::Available,
+            metrics: EndpointAvailability::TemporarilyUnavailable,
+            props: EndpointAvailability::ParseFailed,
+            ..Default::default()
+        };
+        s.apply_capabilities(recovered);
+        assert_eq!(s.events.len(), 4);
+        let rec = s.events.records().back().unwrap();
+        assert_eq!(rec.kind, EventKind::SlotsAvailabilityChanged);
+        assert_eq!(rec.severity, EventSeverity::Info);
+        assert_eq!(rec.message, "slots endpoint available");
+    }
+
+    #[test]
+    fn capability_auth_failure_is_an_error_event() {
+        let mut s = AppState::new(&config());
+        s.apply_capabilities(crate::backend::BackendCapabilities {
+            slots: EndpointAvailability::AuthenticationFailed,
+            ..Default::default()
+        });
+        let rec = s.events.records().back().unwrap();
+        assert_eq!(rec.kind, EventKind::SlotsAvailabilityChanged);
+        assert_eq!(rec.severity, EventSeverity::Error);
+        assert_eq!(rec.message, "slots endpoint authentication failed");
     }
 
     #[test]

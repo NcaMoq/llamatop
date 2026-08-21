@@ -298,6 +298,12 @@ impl AppState {
             }
             // `c` clears whatever the user is looking at: the event log when
             // it is visible, otherwise the history series.
+            //
+            // Clear semantics: clearing the event log leaves exactly one
+            // audit record ("Event log cleared"). An empty log is
+            // indistinguishable from "no events yet", which would mislead
+            // the user into thinking nothing happened; the audit line makes
+            // the clear itself visible and keeps the action auditable.
             InputAction::ClearHistory => {
                 if self.show_events {
                     self.events.clear();
@@ -556,7 +562,7 @@ impl AppState {
         if self.system.is_none() {
             self.log(
                 EventSeverity::Warning,
-                EventKind::SystemMonitorUnavailable,
+                EventKind::SystemMonitorStatusChanged,
                 "System monitor unavailable",
             );
         }
@@ -575,28 +581,28 @@ impl AppState {
                     let count = monitor.gpus.len();
                     self.log(
                         EventSeverity::Info,
-                        EventKind::ServerStateChanged,
+                        EventKind::GpuMonitorStatusChanged,
                         format!("GPU monitoring available ({count} device(s))"),
                     );
                 }
                 GpuMonitorStatus::Unavailable => {
                     self.log(
                         EventSeverity::Warning,
-                        EventKind::GpuMonitorUnavailable,
+                        EventKind::GpuMonitorStatusChanged,
                         "GPU monitoring unavailable",
                     );
                 }
                 GpuMonitorStatus::InitializationFailed => {
                     self.log(
                         EventSeverity::Warning,
-                        EventKind::GpuMonitorUnavailable,
+                        EventKind::GpuMonitorStatusChanged,
                         "GPU initialization failed (NVML)",
                     );
                 }
                 GpuMonitorStatus::SamplingFailed => {
                     self.log(
                         EventSeverity::Warning,
-                        EventKind::GpuMonitorUnavailable,
+                        EventKind::GpuMonitorStatusChanged,
                         "GPU sampling failed",
                     );
                 }
@@ -886,12 +892,15 @@ mod tests {
             "history clear must not log an event-log clear"
         );
 
-        // With events visible, `c` clears the event log and logs the clear.
+        // With events visible, `c` clears the event log and logs the clear:
+        // exactly one audit record remains (never a fully empty log).
         s.handle_input(InputAction::ToggleEvents);
         assert!(s.show_events);
         s.handle_input(InputAction::ClearHistory);
+        assert_eq!(s.events.len(), 1, "clearing leaves exactly one audit record");
         let rec = s.events.records().back().unwrap();
         assert_eq!(rec.kind, EventKind::EventLogCleared);
+        assert_eq!(rec.message, "Event log cleared");
     }
 
     #[test]
@@ -959,7 +968,7 @@ mod tests {
             s.events
                 .records()
                 .iter()
-                .filter(|r| r.kind == EventKind::SystemMonitorUnavailable)
+                .filter(|r| r.kind == EventKind::SystemMonitorStatusChanged)
                 .count(),
             1
         );
@@ -969,7 +978,7 @@ mod tests {
             s.events
                 .records()
                 .iter()
-                .filter(|r| r.kind == EventKind::SystemMonitorUnavailable)
+                .filter(|r| r.kind == EventKind::SystemMonitorStatusChanged)
                 .count(),
             1,
             "the unavailable warning must not repeat"
@@ -1004,11 +1013,21 @@ mod tests {
         s.apply_gpu(gpu_monitor(GpuMonitorStatus::Available, 2));
         assert_eq!(s.gpu.as_ref().unwrap().status, GpuMonitorStatus::Available);
         assert_eq!(s.gpu.as_ref().unwrap().gpus.len(), 2);
-        // A steady available pass does not log again.
+        // A steady available pass does not log again, and the GPU transition
+        // is its own kind (not ServerStateChanged).
         s.apply_gpu(gpu_monitor(GpuMonitorStatus::Available, 2));
         assert_eq!(
-            s.events.records().iter().filter(|r| r.kind == EventKind::ServerStateChanged).count(),
+            s.events
+                .records()
+                .iter()
+                .filter(|r| r.kind == EventKind::GpuMonitorStatusChanged)
+                .count(),
             1
+        );
+        assert_eq!(
+            s.events.records().iter().filter(|r| r.kind == EventKind::ServerStateChanged).count(),
+            0,
+            "GPU transitions must not use the server-state kind"
         );
     }
 
@@ -1026,10 +1045,10 @@ mod tests {
             s.events
                 .records()
                 .iter()
-                .filter(|r| r.kind == EventKind::GpuMonitorUnavailable)
+                .filter(|r| r.kind == EventKind::GpuMonitorStatusChanged)
                 .count(),
-            1,
-            "a steady failure must not spam the log"
+            2,
+            "available + failure are two transitions; a steady failure must not spam"
         );
     }
 
@@ -1043,7 +1062,7 @@ mod tests {
             s.events
                 .records()
                 .iter()
-                .filter(|r| r.kind == EventKind::GpuMonitorUnavailable)
+                .filter(|r| r.kind == EventKind::GpuMonitorStatusChanged)
                 .count(),
             1
         );

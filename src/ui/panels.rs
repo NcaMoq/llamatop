@@ -751,9 +751,12 @@ fn process_line(sys: &SystemSnapshot, symbols: &Symbols) -> String {
     }
 }
 
-/// Compact byte format: 999, 1.2K, 187.8M, 1.5G.
+/// Compact byte format: 999, 1.2KiB, 187.8MiB, 1.5GiB.
+///
+/// The divisions are by 1024, so the IEC units (KiB/MiB/GiB) are used —
+/// "K/M/G" would silently claim decimal (1000-based) units.
 fn bytes(v: u64) -> String {
-    const UNITS: [&str; 4] = ["", "K", "M", "G"];
+    const UNITS: [&str; 4] = ["", "KiB", "MiB", "GiB"];
     let mut value = v as f64;
     let mut idx = 0;
     while value >= 1024.0 && idx < UNITS.len() - 1 {
@@ -1422,9 +1425,9 @@ mod tests {
     #[test]
     fn bytes_compact_format() {
         assert_eq!(bytes(999), "999");
-        assert_eq!(bytes(1234), "1.2K");
-        assert_eq!(bytes(187_800_000), "179.1M");
-        assert_eq!(bytes(1_500_000_000), "1.4G");
+        assert_eq!(bytes(1234), "1.2KiB");
+        assert_eq!(bytes(187_800_000), "179.1MiB");
+        assert_eq!(bytes(1_500_000_000), "1.4GiB");
     }
 
     #[test]
@@ -1473,7 +1476,7 @@ mod tests {
         let line = process_line(&snap, &sym);
         assert!(line.contains("llama-server.exe"));
         assert!(line.contains("PID 42"));
-        assert!(line.contains("27.6G"), "process memory is GiB: {line}");
+        assert!(line.contains("27.6GiB"), "process memory is GiB: {line}");
         assert!(
             line.contains("endpoint not verified"),
             "a name match must not claim a verified association: {line}"

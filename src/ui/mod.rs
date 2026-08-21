@@ -1212,7 +1212,7 @@ mod tests {
     fn event_panel_renders_when_toggled() {
         let state = state_with_events(&[
             (EventSeverity::Info, EventKind::Connected, "Connected"),
-            (EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable"),
+            (EventSeverity::Warning, EventKind::MetricsAvailabilityChanged, "Metrics unavailable"),
             (EventSeverity::Error, EventKind::Disconnected, "Connection lost"),
         ]);
         let content = render_content(&state, false, 100, 30);
@@ -1258,7 +1258,7 @@ mod tests {
         for _ in 0..3 {
             state.events.push(
                 EventSeverity::Warning,
-                EventKind::MetricsUnavailable,
+                EventKind::MetricsAvailabilityChanged,
                 "Metrics unavailable",
             );
         }
@@ -1323,7 +1323,7 @@ mod tests {
     fn event_panel_ascii_mode_is_ascii_only() {
         let state = state_with_events(&[
             (EventSeverity::Info, EventKind::Connected, "Connected"),
-            (EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable"),
+            (EventSeverity::Warning, EventKind::MetricsAvailabilityChanged, "Metrics unavailable"),
         ]);
         let ascii = render_content(&state, true, 100, 30);
         assert!(ascii.contains("PgUp/PgDn"));
@@ -1366,10 +1366,10 @@ mod tests {
         let content = render_content(&state, false, 120, 40);
         assert!(content.contains("Resources"), "panel title must render");
         assert!(content.contains("CPU 42.0%"), "host CPU shown");
-        assert!(content.contains("14.9G/59.6G"), "RAM used/total compact");
+        assert!(content.contains("14.9GiB/59.6GiB"), "RAM used/total compact (IEC units)");
         assert!(content.contains("llama-server.exe"), "the candidate process is named");
         assert!(content.contains("PID 6348"), "candidate PID shown");
-        assert!(content.contains("27.6G"), "process memory compact (GiB)");
+        assert!(content.contains("27.6GiB"), "process memory compact (GiB)");
         assert!(content.contains("2 h"), "uptime human-formatted");
         // A name match must not be presented as a verified association.
         assert!(content.contains("endpoint not verified"));
@@ -1519,7 +1519,7 @@ mod tests {
         assert!(content.contains("NVIDIA RTX 5090"), "first GPU named");
         assert!(content.contains("NVIDIA RTX 4090"), "second GPU named");
         assert!(content.contains("42%"), "utilization shown");
-        assert!(content.contains("1.0G/16.0G"), "VRAM used/total compact");
+        assert!(content.contains("1.0GiB/16.0GiB"), "VRAM used/total compact (IEC units)");
         assert!(content.contains("55C"), "temperature shown");
         assert!(content.contains("120/350W"), "power/limit shown");
         // The GPU rows must never claim the device belongs to llama-server.

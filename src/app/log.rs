@@ -36,10 +36,11 @@ pub enum EventKind {
     Disconnected,
     Reconnecting,
     AuthenticationFailed,
+    /// The llama.cpp server lifecycle state changed (ready/loading/sleeping,
+    /// restart detected). GPU/system monitor transitions have their own
+    /// kinds.
     ServerStateChanged,
     WorkloadPhaseChanged,
-    MetricsUnavailable,
-    SlotsUnavailable,
     /// An endpoint observation changed (availability, unsupported, parse
     /// failure, authentication). One variant per endpoint so the log shows
     /// which endpoint changed.
@@ -49,9 +50,15 @@ pub enum EventKind {
     ManualReconnect,
     PauseChanged,
     HistoryCleared,
+    /// The event log was cleared. The single audit record left behind keeps
+    /// a cleared log distinguishable from "no events yet".
     EventLogCleared,
-    SystemMonitorUnavailable,
-    GpuMonitorUnavailable,
+    /// The system monitor (host CPU/RAM + llama-server process) status
+    /// changed.
+    SystemMonitorStatusChanged,
+    /// The GPU monitor status changed (available, unavailable, NVML
+    /// initialization or sampling failure).
+    GpuMonitorStatusChanged,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,13 +146,25 @@ mod tests {
     #[test]
     fn repeated_identical_event_increments_repeat_count() {
         let mut log = EventLog::default();
-        log.push(EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable");
-        log.push(EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable");
-        log.push(EventSeverity::Warning, EventKind::MetricsUnavailable, "Metrics unavailable");
+        log.push(
+            EventSeverity::Warning,
+            EventKind::MetricsAvailabilityChanged,
+            "metrics endpoint temporarily unavailable",
+        );
+        log.push(
+            EventSeverity::Warning,
+            EventKind::MetricsAvailabilityChanged,
+            "metrics endpoint temporarily unavailable",
+        );
+        log.push(
+            EventSeverity::Warning,
+            EventKind::MetricsAvailabilityChanged,
+            "metrics endpoint temporarily unavailable",
+        );
         assert_eq!(log.len(), 1);
         let r = log.records().back().unwrap();
         assert_eq!(r.repeat_count, 3);
-        assert_eq!(r.kind, EventKind::MetricsUnavailable);
+        assert_eq!(r.kind, EventKind::MetricsAvailabilityChanged);
     }
 
     #[test]
